@@ -1,0 +1,14 @@
+# XIns Downloader 依赖
+# 安装：python -m pip install -r requirements.txt
+# 浏览器内核：python -m patchright install chromium
+
+# Web 框架与服务
+fastapi==0.137.1
+uvicorn[standard]==0.49.0
+
+# Instagram 采集
+instaloader==4.14.1     # 旧方案，保留为应急兜底（默认关闭，见 account-safety 规格）
+patchright==1.61.1      # 反检测浏览器自动化（主采集路径），API 兼容 Playwright
+
+# HTTP 客户端（下载 CDN 媒体 / media-proxy）
+httpx==0.27.0
