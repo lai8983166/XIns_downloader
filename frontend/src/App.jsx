@@ -22,6 +22,7 @@ function App() {
   const [postSelected, setPostSelected] = useState(() => new Set());
   const [profilePreview, setProfilePreview] = useState(null);
   const [profileSelected, setProfileSelected] = useState(() => new Set());
+  const [profileStartOffset, setProfileStartOffset] = useState("");
   const [lightbox, setLightbox] = useState(null);
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
@@ -115,7 +116,8 @@ function App() {
       return;
     }
 
-    const cursor = reset ? 0 : profilePreview?.next_cursor;
+    const startOffset = Number(profileStartOffset) || 0;
+    const cursor = reset ? startOffset : profilePreview?.next_cursor;
     if (cursor === null || cursor === undefined) {
       return;
     }
@@ -124,10 +126,10 @@ function App() {
       setLoading(true);
       setProfilePreview(null);
       setProfileSelected(new Set());
-      setStatus("正在获取 Profile 首屏内容...");
+      setStatus(startOffset > 0 ? `正在从第 ${startOffset + 1} 个加载...` : "正在获取 Profile 首屏内容...");
     } else {
       setLoadingMore(true);
-      setStatus("正在加载更多帖子...");
+      setStatus("正在加载下一页...");
     }
 
     try {
@@ -137,20 +139,13 @@ function App() {
         limit: PROFILE_PAGE_SIZE,
       });
 
-      setProfilePreview((current) => {
-        if (reset || !current) {
-          return data;
-        }
+      // 分页替换显示：每次只显示当前这批（不累积）；加载更多清空旧勾选
+      setProfilePreview({ ...data, posts: data.posts });
+      if (!reset) {
+        setProfileSelected(new Set());
+      }
 
-        return {
-          ...data,
-          posts: [...current.posts, ...data.posts],
-        };
-      });
-
-      // 新加载的批次默认不勾选；reset 时已在上方清空 profileSelected
-
-      setStatus(`已加载 ${reset ? data.posts.length : profilePosts.length + data.posts.length} 个帖子`);
+      setStatus(`显示第 ${data.cursor + 1}–${data.cursor + data.posts.length} 个，共 ${data.mediacount ?? "?"}（本页 ${data.posts.length} 个）`);
     } catch (error) {
       setStatus(error.message);
     } finally {
@@ -294,6 +289,18 @@ function App() {
             placeholder={mode === "profile" ? "输入用户名或主页链接" : "粘贴 Instagram 帖子、Reel 或 TV 链接"}
             aria-label={mode === "profile" ? "Instagram 用户名" : "Instagram 链接"}
           />
+          {mode === "profile" && (
+            <input
+              className="urlInput"
+              type="number"
+              min="0"
+              value={profileStartOffset}
+              onChange={(event) => setProfileStartOffset(event.target.value)}
+              placeholder="从第几个开始（留空=最新）"
+              aria-label="起始位置（跳过前 N 个）"
+              style={{ maxWidth: 180 }}
+            />
+          )}
           <button className="primaryButton" disabled={loading} type="submit">
             {loading ? "获取中" : "确认"}
           </button>

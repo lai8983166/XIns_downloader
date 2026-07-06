@@ -368,7 +368,7 @@ def _build_profile_response(username: str, entry: dict, cursor: int, limit: int)
     exhausted = entry["exhausted"]
     returned = len(slice_nodes)
     end_offset = cursor + returned
-    has_more = (end_offset < len(nodes)) or (not exhausted and returned == limit and returned > 0)
+    has_more = (not exhausted) or (end_offset < len(nodes))
     if exhausted and end_offset >= len(nodes):
         has_more = False
     next_cursor = end_offset if has_more else None
@@ -386,16 +386,33 @@ def _build_profile_response(username: str, entry: dict, cursor: int, limit: int)
     )
 
 
+async def _scroll_until(page, captured: list, need: int, state: dict, scroll_lo: float, scroll_hi: float) -> None:
+    """逐步 scrollTo 页底 + 轮询等新响应，直到 captured>=need 或 exhausted 或 attempts 用尽。
+
+    续传时 captured 起点高，循环 1 次即满足（只滚一页）；首次则从当前滚到 need。
+    """
+    attempts = 0
+    while len(captured) < need and not state["exhausted"] and attempts < 40:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(random.uniform(scroll_lo, scroll_hi))
+        prev = len(captured)
+        waited = 0
+        while len(captured) == prev and waited < 10 and not state["exhausted"]:
+            await asyncio.sleep(0.5)
+            waited += 1
+        attempts += 1
+
+
 async def preview_profile(
     profile_value: str,
     cursor: int = 0,
     limit: Optional[int] = None,
 ) -> ProfilePreview:
-    """采集 Profile 分页预览（async，整型 cursor 偏移分页）。
+    """采集 Profile 分页预览（async，整型 cursor 偏移分页 + 持久 page 续传）。
 
+    - 首次 / TTL 失效 / 失活降级：导航 profile + 滚到 need。
+    - 加载更多（已 navigated）：复用持久 page，接着滚到 need（续传，只多滚一页）。
     - 冷却/配额/信号检测同 preview_post。
-    - 内存缓存（TTL，design D6）：已加载范围内的翻页直接切片，不重复导航；
-      超出已加载范围才重新导航 + 逐步滚动捕获更多。
 
     Raises CollectorError：invalid_url(400) / login_required(401) / rate_limited(429) /
       quota(429) / cooldown(429) / not_found(404) / parse(502)
@@ -421,18 +438,31 @@ async def preview_profile(
     need = cursor + bounded_limit
     now = time.time()
     entry = _profile_cache.get(username)
-    if entry and (now - entry["fetched_at"] < _PROFILE_CACHE_TTL) and (
-        len(entry["nodes"]) >= need or entry["exhausted"]
-    ):
+
+    # TTL 失效 → 废弃持久 page + 清缓存（强制重新导航）
+    if entry and (now - entry["fetched_at"] >= _PROFILE_CACHE_TTL):
+        await session.close_profile_page(username)
+        entry = None
+
+    # 缓存够 → 直接切片返回
+    if entry and (len(entry["nodes"]) >= need or entry["exhausted"]):
         return _build_profile_response(username, entry, cursor, bounded_limit)
 
-    captured: list = []
-    state = {"end_cursor": None, "exhausted": False}
     url = INSTAGRAM_PROFILE_URL.format(username=username)
     nav_lo, nav_hi = settings.nav_stabilize
     scroll_lo, scroll_hi = settings.scroll_delay
 
-    async with session.page() as page:
+    # 累积（非覆盖）+ 去重集合
+    captured: list = list(entry["nodes"]) if entry else []
+    have_codes = {n.get("code") for n in captured}
+    user_info = dict(entry["user_info"]) if entry and entry.get("user_info") else {}
+    state = {
+        "end_cursor": entry["end_cursor"] if entry else None,
+        "exhausted": entry["exhausted"] if entry else False,
+    }
+    can_resume = bool(entry and entry.get("navigated"))
+
+    async with session.profile_page(username) as page:
         async def on_response(resp):
             try:
                 if "json" not in resp.headers.get("content-type", ""):
@@ -446,37 +476,67 @@ async def preview_profile(
                 return
             for edge in conn.get("edges") or []:
                 node = edge.get("node") if isinstance(edge, dict) else None
-                if isinstance(node, dict) and node.get("code"):
+                if isinstance(node, dict) and node.get("code") and node["code"] not in have_codes:
                     captured.append(node)
+                    have_codes.add(node["code"])
             pi = conn.get("page_info") or {}
-            state["end_cursor"] = pi.get("end_cursor")
-            state["exhausted"] = not bool(pi.get("has_next_page"))
+            if pi.get("end_cursor"):
+                state["end_cursor"] = pi.get("end_cursor")
+            if "has_next_page" in pi:
+                state["exhausted"] = not bool(pi.get("has_next_page"))
 
+        # 持久 page 跨调用复用 → 移除上次 listener、注册本次（避免叠加回调）
+        prev_listener = getattr(page, "_xins_listener", None)
+        if prev_listener is not None:
+            try:
+                page.remove_listener("response", prev_listener)
+            except Exception:
+                pass
         page.on("response", on_response)
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(random.uniform(nav_lo, nav_hi))
+        page._xins_listener = on_response
 
-        signal = detect_signal(url=page.url)
-        if signal:
-            cooldown.report(signal)
-            kind, status = _SIGNAL_KIND.get(signal, ("parse", 502))
-            raise CollectorError(kind, f"Instagram 风控信号：{signal}", status)
+        async def do_navigate_and_scroll():
+            """首次 / 降级：导航 profile + 滚到 need（同一持久 page 上 goto）。"""
+            nonlocal user_info
+            captured.clear()
+            have_codes.clear()
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(random.uniform(nav_lo, nav_hi))
+            signal = detect_signal(url=page.url)
+            if signal:
+                cooldown.report(signal)
+                kind, status = _SIGNAL_KIND.get(signal, ("parse", 502))
+                raise CollectorError(kind, f"Instagram 风控信号：{signal}", status)
+            html = await page.content()
+            await asyncio.sleep(1.0)  # 等首屏 user_timeline 响应
+            await _scroll_until(page, captured, need, state, scroll_lo, scroll_hi)
+            user_info = _parse_profile_meta(html)
+            if captured:
+                u = captured[0].get("user") or {}
+                if "is_private" in u:
+                    user_info["is_private"] = bool(u.get("is_private"))
 
-        html = await page.content()
-        await asyncio.sleep(1.0)  # 等首屏 user_timeline 响应
+        async def do_resume_scroll() -> bool:
+            """续传：page 已在 profile 页，接着滚到 need。返回 False 表示需降级重导航。"""
+            if f"instagram.com/{username}" not in (page.url or ""):
+                return False
+            before = len(captured)
+            await _scroll_until(page, captured, need, state, scroll_lo, scroll_hi)
+            signal = detect_signal(url=page.url)
+            if signal:
+                cooldown.report(signal)
+                kind, status = _SIGNAL_KIND.get(signal, ("parse", 502))
+                raise CollectorError(kind, f"Instagram 风控信号：{signal}", status)
+            if len(captured) == before and not state["exhausted"]:
+                return False  # 零增长 → page 状态坏 → 降级
+            return True
 
-        # 逐步滚动，捕获更多帖子，直至够数或翻完（design D1/D5）
-        attempts = 0
-        while len(captured) < need and not state["exhausted"] and attempts < 40:
-            await page.mouse.wheel(0, 4000)
-            await asyncio.sleep(random.uniform(scroll_lo, scroll_hi))
-            attempts += 1
-
-        user_info = _parse_profile_meta(html)
-        if captured:
-            u = captured[0].get("user") or {}
-            if "is_private" in u:
-                user_info["is_private"] = bool(u.get("is_private"))
+        if can_resume:
+            ok = await do_resume_scroll()
+            if not ok:
+                await do_navigate_and_scroll()  # 降级：同一 page 上 goto 重新导航
+        else:
+            await do_navigate_and_scroll()
 
     entry = {
         "nodes": captured,
@@ -484,10 +544,11 @@ async def preview_profile(
         "exhausted": state["exhausted"],
         "fetched_at": time.time(),
         "user_info": user_info,
+        "navigated": True,
     }
     _profile_cache[username] = entry
 
-    if not captured and not user_info["mediacount"]:
+    if not captured and not user_info.get("mediacount"):
         raise CollectorError(
             "not_found",
             "未找到 Profile 内容（用户不存在/私密未关注/页面结构变更）",

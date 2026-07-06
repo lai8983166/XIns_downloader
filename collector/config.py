@@ -76,7 +76,7 @@ class Settings:
 
     # 配额上限
     session_window_minutes: int = field(default_factory=lambda: _env_int("XINS_SESSION_WINDOW_MINUTES", 60))
-    session_action_limit: int = field(default_factory=lambda: _env_int("XINS_SESSION_ACTION_LIMIT", 30))
+    session_action_limit: int = field(default_factory=lambda: _env_int("XINS_SESSION_ACTION_LIMIT", 60))
     daily_action_limit: int = field(default_factory=lambda: _env_int("XINS_DAILY_ACTION_LIMIT", 120))
 
     # 冷却退避（分钟）
@@ -87,6 +87,9 @@ class Settings:
 
     # Profile 分页
     profile_page_size: int = field(default_factory=lambda: _env_int("PROFILE_PAGE_SIZE", 6))
+
+    # Profile 持久 page 池容量（LRU，跨请求复用同一 tab 续传滚动）
+    profile_page_pool_max: int = field(default_factory=lambda: _env_int("XINS_PROFILE_PAGE_POOL_MAX", 4))
 
     # instaloader 应急兜底开关（默认关闭）
     enable_instaloader_fallback: bool = field(default_factory=lambda: _env_bool("ENABLE_INSTALOADER_FALLBACK", False))
