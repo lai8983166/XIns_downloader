@@ -1,7 +1,19 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 const PROFILE_PAGE_SIZE = 6;
+const AUTO_POLL_INTERVAL_MS = 2000;
+const AUTO_TERMINAL_STATES = ["done", "failed", "cancelled"];
+const AUTO_STATE_LABELS = {
+  starting: "启动中",
+  running: "运行中",
+  paused_cooldown: "冷却暂停",
+  paused_signal_budget: "信号预算用尽",
+  paused_circuit: "已熔断",
+  done: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 
 function proxiedMediaUrl(mediaUrl) {
   if (!mediaUrl) {
@@ -15,19 +27,48 @@ function mediaKey(shortcode, index) {
   return `${shortcode}:${index}`;
 }
 
+function formatRemaining(iso) {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "即将恢复";
+  }
+  const minutes = Math.ceil(ms / 60000);
+  return minutes >= 60 ? `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分后恢复` : `${minutes} 分钟后恢复`;
+}
+
+function formatClock(iso) {
+  if (!iso) {
+    return "";
+  }
+  return new Date(iso).toLocaleTimeString();
+}
+
 function App() {
   const [mode, setMode] = useState("post");
+  const [platform, setPlatform] = useState("ig");
   const [input, setInput] = useState("");
   const [postPreview, setPostPreview] = useState(null);
   const [postSelected, setPostSelected] = useState(() => new Set());
   const [profilePreview, setProfilePreview] = useState(null);
   const [profileSelected, setProfileSelected] = useState(() => new Set());
   const [profileStartOffset, setProfileStartOffset] = useState("");
+  const [autoMaxPosts, setAutoMaxPosts] = useState("");
+  const [autoJobId, setAutoJobId] = useState(null);
+  const [autoStatus, setAutoStatus] = useState(null);
+  const [autoStarting, setAutoStarting] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [downloading, setDownloading] = useState(false);
+
+  const autoTerminal = AUTO_TERMINAL_STATES.includes(autoStatus?.state);
+
+  const isThreads = platform === "threads";
+  const profilePath = isThreads ? "/threads/profile/preview" : "/profile/preview";
+  const profileDownloadPath = isThreads ? "/threads/profile/download" : "/profile/download";
+  // Threads 只有 profile；IG 有 post/profile。effectiveMode 统一判断
+  const effectiveMode = isThreads ? "profile" : mode;
 
   const postResources = postPreview?.resources ?? [];
   const profilePosts = profilePreview?.posts ?? [];
@@ -45,7 +86,38 @@ function App() {
     [profilePosts]
   );
 
-  const selectedCount = mode === "post" ? postSelected.size : profileSelected.size;
+  const selectedCount = effectiveMode === "post" ? postSelected.size : profileSelected.size;
+
+  // 自动任务状态轮询：job 存在且未终态时每 2s 拉一次
+  useEffect(() => {
+    if (!autoJobId || autoTerminal) {
+      return undefined;
+    }
+    let cancelled = false;
+    async function pollAutoJob() {
+      try {
+        const response = await fetch(`${API_BASE}/profile/auto/jobs/${autoJobId}`);
+        if (response.status === 404) {
+          setAutoStatus(null);
+          setStatus("任务不存在（后端重启后注册表清空），可重新启动续跑");
+          setAutoJobId(null);
+          return;
+        }
+        const data = await response.json().catch(() => ({}));
+        if (!cancelled && response.ok) {
+          setAutoStatus(data);
+        }
+      } catch {
+        // 网络抖动：下一轮再试
+      }
+    }
+    pollAutoJob();
+    const timer = setInterval(pollAutoJob, AUTO_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [autoJobId, autoTerminal]);
 
   async function requestJson(path, body) {
     const response = await fetch(`${API_BASE}${path}`, {
@@ -62,13 +134,19 @@ function App() {
     return data;
   }
 
-  function resetResults(nextMode = mode) {
+  function resetResults(nextMode = effectiveMode) {
     setPostPreview(null);
     setProfilePreview(null);
     setPostSelected(new Set());
     setProfileSelected(new Set());
     setLightbox(null);
-    setStatus(nextMode === "profile" ? "输入用户名或主页链接后分页预览。" : "输入帖子链接后预览图片。");
+    setStatus(
+      nextMode === "profile"
+        ? "输入用户名或主页链接后分页预览。"
+        : nextMode === "auto"
+          ? "输入 Instagram 用户主页链接，启动后自动翻页下载全部内容。"
+          : "输入帖子链接后预览图片。"
+    );
   }
 
   function handleModeChange(nextMode) {
@@ -76,13 +154,78 @@ function App() {
     resetResults(nextMode);
   }
 
+  function handlePlatformChange(nextPlatform) {
+    setPlatform(nextPlatform);
+    if (nextPlatform === "threads") {
+      setMode("profile");
+    }
+    setPostPreview(null);
+    setProfilePreview(null);
+    setPostSelected(new Set());
+    setProfileSelected(new Set());
+    setLightbox(null);
+    setStatus(nextPlatform === "threads" ? "输入 Threads 用户名后分页预览。" : "输入帖子链接后预览图片。");
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
-    if (mode === "profile") {
+    if (effectiveMode === "profile") {
       await loadProfilePage({ reset: true });
       return;
     }
+    if (effectiveMode === "auto") {
+      await startAutoJob();
+      return;
+    }
     await loadPostPreview();
+  }
+
+  async function startAutoJob() {
+    const profile = input.trim();
+    if (!profile) {
+      setStatus("请输入 Instagram 用户名或主页链接");
+      return;
+    }
+    setAutoStarting(true);
+    try {
+      const response = await fetch(`${API_BASE}/profile/auto`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          profile,
+          max_posts: autoMaxPosts ? Number(autoMaxPosts) : null,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.status === 409 && data.detail?.job_id) {
+        setStatus(data.detail.message || "已有活跃任务");
+        setAutoJobId(data.detail.job_id); // 跳转到现有任务视图
+        return;
+      }
+      if (!response.ok) {
+        setStatus(typeof data.detail === "string" ? data.detail : data.detail?.message || "启动失败，请稍后重试");
+        return;
+      }
+      setAutoStatus(null);
+      setAutoJobId(data.job_id);
+      setStatus(`自动任务已启动：@${data.username}，将按拟人日程自动翻页下载`);
+    } catch (error) {
+      setStatus(`启动失败：${error.message}`);
+    } finally {
+      setAutoStarting(false);
+    }
+  }
+
+  async function cancelAutoJob() {
+    if (!autoJobId) {
+      return;
+    }
+    try {
+      await fetch(`${API_BASE}/profile/auto/jobs/${autoJobId}/cancel`, { method: "POST" });
+      setStatus("已请求取消，任务将在当前动作完成后停止（清单保留，可再次启动续跑）");
+    } catch (error) {
+      setStatus(`取消失败：${error.message}`);
+    }
   }
 
   async function loadPostPreview() {
@@ -112,7 +255,7 @@ function App() {
   async function loadProfilePage({ reset }) {
     const profile = input.trim();
     if (!profile) {
-      setStatus("请输入 Instagram 用户名或主页链接");
+      setStatus(isThreads ? "请输入 Threads 用户名或主页链接" : "请输入 Instagram 用户名或主页链接");
       return;
     }
 
@@ -133,7 +276,7 @@ function App() {
     }
 
     try {
-      const data = await requestJson("/profile/preview", {
+      const data = await requestJson(profilePath, {
         profile,
         cursor,
         limit: PROFILE_PAGE_SIZE,
@@ -155,7 +298,7 @@ function App() {
   }
 
   async function handleDownload() {
-    if (mode === "profile") {
+    if (effectiveMode === "profile") {
       await downloadProfileSelection();
       return;
     }
@@ -216,7 +359,7 @@ function App() {
     setStatus("正在下载已勾选的 Profile 资源...");
 
     try {
-      const data = await requestJson("/profile/download", {
+      const data = await requestJson(profileDownloadPath, {
         username: profilePreview.username,
         items: Array.from(itemsByPost, ([shortcode, selected_indices]) => ({
           shortcode,
@@ -259,37 +402,70 @@ function App() {
 
   const canDownload =
     downloading ||
-    (mode === "post" && postResources.length > 0 && postSelected.size === 0) ||
-    (mode === "profile" && profileMedia.length > 0 && profileSelected.size === 0);
+    (effectiveMode === "post" && postResources.length > 0 && postSelected.size === 0) ||
+    (effectiveMode === "profile" && profileMedia.length > 0 && profileSelected.size === 0);
 
   return (
     <main className="page">
       <header className="topbar">
         <form className="urlForm" onSubmit={handleSubmit}>
-          <div className="modeSwitch" role="tablist" aria-label="下载模式">
+          <div className="modeSwitch" role="tablist" aria-label="平台">
             <button
-              className={mode === "post" ? "modeButton active" : "modeButton"}
+              className={platform === "ig" ? "modeButton active" : "modeButton"}
               type="button"
-              onClick={() => handleModeChange("post")}
+              onClick={() => handlePlatformChange("ig")}
             >
-              单帖
+              Instagram
             </button>
             <button
-              className={mode === "profile" ? "modeButton active" : "modeButton"}
+              className={platform === "threads" ? "modeButton active" : "modeButton"}
               type="button"
-              onClick={() => handleModeChange("profile")}
+              onClick={() => handlePlatformChange("threads")}
             >
-              Profile
+              Threads
             </button>
           </div>
+          {!isThreads && (
+            <div className="modeSwitch" role="tablist" aria-label="下载模式">
+              <button
+                className={mode === "post" ? "modeButton active" : "modeButton"}
+                type="button"
+                onClick={() => handleModeChange("post")}
+              >
+                单帖
+              </button>
+              <button
+                className={mode === "profile" ? "modeButton active" : "modeButton"}
+                type="button"
+                onClick={() => handleModeChange("profile")}
+              >
+                Profile
+              </button>
+              <button
+                className={mode === "auto" ? "modeButton active" : "modeButton"}
+                type="button"
+                onClick={() => handleModeChange("auto")}
+              >
+                自动
+              </button>
+            </div>
+          )}
           <input
             className="urlInput"
             value={input}
             onChange={(event) => setInput(event.target.value)}
-            placeholder={mode === "profile" ? "输入用户名或主页链接" : "粘贴 Instagram 帖子、Reel 或 TV 链接"}
-            aria-label={mode === "profile" ? "Instagram 用户名" : "Instagram 链接"}
+            placeholder={
+              isThreads
+                ? "输入 Threads 用户名或主页链接"
+                : effectiveMode === "post"
+                  ? "粘贴 Instagram 帖子、Reel 或 TV 链接"
+                  : "输入用户名或主页链接"
+            }
+            aria-label={
+              isThreads ? "Threads 用户名" : effectiveMode === "post" ? "Instagram 链接" : "Instagram 用户名"
+            }
           />
-          {mode === "profile" && (
+          {effectiveMode === "profile" && (
             <input
               className="urlInput"
               type="number"
@@ -301,12 +477,26 @@ function App() {
               style={{ maxWidth: 180 }}
             />
           )}
-          <button className="primaryButton" disabled={loading} type="submit">
-            {loading ? "获取中" : "确认"}
+          {effectiveMode === "auto" && (
+            <input
+              className="urlInput"
+              type="number"
+              min="1"
+              value={autoMaxPosts}
+              onChange={(event) => setAutoMaxPosts(event.target.value)}
+              placeholder="本次最多新帖数（留空=全部）"
+              aria-label="自动模式上限"
+              style={{ maxWidth: 200 }}
+            />
+          )}
+          <button className="primaryButton" disabled={loading || autoStarting} type="submit">
+            {effectiveMode === "auto" ? (autoStarting ? "启动中" : "启动") : loading ? "获取中" : "确认"}
           </button>
-          <button className="downloadButton" disabled={canDownload} type="button" onClick={handleDownload}>
-            {downloading ? "下载中" : "下载"}
-          </button>
+          {effectiveMode !== "auto" && (
+            <button className="downloadButton" disabled={canDownload} type="button" onClick={handleDownload}>
+              {downloading ? "下载中" : "下载"}
+            </button>
+          )}
         </form>
       </header>
 
@@ -317,8 +507,8 @@ function App() {
             <p>{status || "输入链接后预览图片，勾选需要的资源再下载。"}</p>
           </div>
           <div className="meta">
-            {mode === "post" && postPreview && <span>{postPreview.shortcode}</span>}
-            {mode === "profile" && profilePreview && (
+            {effectiveMode === "post" && postPreview && <span>{postPreview.shortcode}</span>}
+            {effectiveMode === "profile" && profilePreview && (
               <>
                 <span>@{profilePreview.username}</span>
                 <span>{profilePosts.length}/{profilePreview.mediacount} 帖子</span>
@@ -328,7 +518,7 @@ function App() {
           </div>
         </div>
 
-        {mode === "profile" && profilePreview && (
+        {effectiveMode === "profile" && profilePreview && (
           <div className="profileBar">
             <img src={proxiedMediaUrl(profilePreview.profile_pic_url)} alt={profilePreview.username} />
             <div>
@@ -338,7 +528,9 @@ function App() {
           </div>
         )}
 
-        {mode === "post" ? (
+        {effectiveMode === "auto" ? (
+          <AutoJobPanel jobId={autoJobId} status={autoStatus} onCancel={cancelAutoJob} />
+        ) : effectiveMode === "post" ? (
           <MediaGrid
             items={postResources.map((item) => ({
               ...item,
@@ -382,6 +574,91 @@ function App() {
         </div>
       )}
     </main>
+  );
+}
+
+function AutoJobPanel({ jobId, status, onCancel }) {
+  if (!jobId) {
+    return (
+      <div className="emptyState">
+        <div className="emptyMark">自动</div>
+        <p>输入主页链接并点击「启动」，后台将按拟人日程自动翻页下载全部内容</p>
+      </div>
+    );
+  }
+
+  const state = status?.state ?? "starting";
+  const stateLabel = AUTO_STATE_LABELS[state] ?? state;
+  const counts = status?.counts ?? {};
+  const total = status?.mediacount ?? null;
+  const processed = status?.posts_total ?? 0;
+  const progressPercent =
+    total && total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : null;
+  const terminal = AUTO_TERMINAL_STATES.includes(state);
+
+  return (
+    <div className="autoPanel">
+      <div className="autoHeader">
+        <span className={`stateChip ${terminal ? "stateTerminal" : state.startsWith("paused") ? "statePaused" : "stateActive"}`}>
+          {stateLabel}
+        </span>
+        <strong>@{status?.username ?? "…"}</strong>
+        {status?.max_posts ? <span>上限 {status.max_posts} 新帖</span> : null}
+        <span>job {jobId}</span>
+      </div>
+
+      {status?.paused_reason && (
+        <p className="autoReason">
+          {status.paused_reason}
+          {status.resume_at ? `（${formatRemaining(status.resume_at)}，${formatClock(status.resume_at)}）` : ""}
+        </p>
+      )}
+
+      <div className="autoProgress">
+        <div className="autoProgressLabel">
+          <span>
+            已处理 {processed}/{total ?? "?"} 帖
+            {status?.has_more === false ? "（已到时间线末尾）" : ""}
+          </span>
+          {progressPercent !== null && <span>{progressPercent}%</span>}
+        </div>
+        <div className="autoProgressBar">
+          <div className="autoProgressFill" style={{ width: `${progressPercent ?? 100}%` }} />
+        </div>
+      </div>
+
+      <div className="autoCounts">
+        <span>已下载 {counts.downloaded ?? 0}</span>
+        <span>跳过 {counts.skipped ?? 0}</span>
+        <span>失败 {counts.failed ?? 0}</span>
+        {status?.next_action_at && <span>下一动作 {formatClock(status.next_action_at)}</span>}
+      </div>
+
+      {status?.recent_failures?.length > 0 && (
+        <details className="autoFailures">
+          <summary>最近失败（{status.recent_failures.length}）</summary>
+          <ul>
+            {status.recent_failures.slice(-5).reverse().map((failure, index) => (
+              <li key={index}>
+                <code>{failure.shortcode ?? "-"}</code> {failure.detail}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      <div className="autoActions">
+        {!terminal ? (
+          <button className="secondaryButton" type="button" onClick={onCancel}>
+            取消任务
+          </button>
+        ) : (
+          <span className="autoDoneHint">
+            {state === "done" ? "本次采集完成；再次启动可增量拉取新帖" : `任务已${stateLabel}；清单已保留，可再次启动续跑`}
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

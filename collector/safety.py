@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import date
 from typing import Optional
 
 from collector.config import settings
@@ -39,7 +40,7 @@ _ACTION_BLOCKED_PHRASES = (
     "temporarily blocked",
 )
 _CHALLENGE_HINTS = ("/challenge", "/interventions", "/confirm")
-_LOGIN_HINTS = ("/accounts/login",)
+_LOGIN_HINTS = ("/accounts/login", "/login")  # IG: /accounts/login；Threads: /login
 
 
 def detect_signal(
@@ -94,6 +95,9 @@ class CooldownState:
         self._until = 0.0  # 冷却到期时间戳
         self._last_signal_at = 0.0
         self._last_reason: Optional[str] = None
+        # 每日风控信号预算计数（auto-download-mode：按本地自然日，跨日重置）
+        self._signal_day: Optional[date] = None
+        self._daily_signals = 0
 
     def _maybe_reset(self, now: float) -> None:
         """连续 24 小时无信号则档位归零。"""
@@ -109,7 +113,10 @@ class CooldownState:
                 raise CoolDown(self._until - now, self._last_reason)
 
     def report(self, signal: str) -> int:
-        """上报一个风控信号，进入/加深冷却。返回本次冷却秒数。"""
+        """上报一个风控信号，进入/加深冷却。返回本次冷却秒数。
+
+        同时累加"每日风控信号预算"计数（本地自然日，跨日重置）。
+        """
         with self._lock:
             now = time.time()
             self._maybe_reset(now)
@@ -119,7 +126,23 @@ class CooldownState:
             self._level = min(self._level + 1, len(self._steps_sec))
             self._last_signal_at = now
             self._last_reason = signal
+            today = date.today()
+            if self._signal_day != today:
+                self._signal_day = today
+                self._daily_signals = 0
+            self._daily_signals += 1
             return secs
+
+    def daily_signal_status(self) -> dict:
+        """当日风控信号命中情况（自动任务据此判断是否当日停跑）。"""
+        with self._lock:
+            today = date.today()
+            count = self._daily_signals if self._signal_day == today else 0
+            return {
+                "date": today.isoformat(),
+                "count": count,
+                "limit": settings.daily_signal_limit,
+            }
 
     def status(self) -> dict:
         with self._lock:
@@ -134,3 +157,8 @@ class CooldownState:
 
 
 cooldown = CooldownState(settings.cooldown_steps_min, settings.cooldown_max_minutes)
+
+
+def daily_signal_status() -> dict:
+    """模块级便捷出口：当日风控信号命中情况。"""
+    return cooldown.daily_signal_status()

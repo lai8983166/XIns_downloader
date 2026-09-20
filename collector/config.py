@@ -74,10 +74,21 @@ class Settings:
         default_factory=lambda: _env_float_pair("XINS_SCROLL_DELAY_MIN_SEC", "XINS_SCROLL_DELAY_MAX_SEC", (1.5, 3.5))
     )
 
-    # 配额上限
+    # 动作调度（每小时窗口预算 + jittered grid 日程；每日动作配额已移除）
+    # 注意：min_action_gap_sec 需 ≤ 窗口时长/名额（3600/300=12s）才能使上限可达
     session_window_minutes: int = field(default_factory=lambda: _env_int("XINS_SESSION_WINDOW_MINUTES", 60))
-    session_action_limit: int = field(default_factory=lambda: _env_int("XINS_SESSION_ACTION_LIMIT", 60))
-    daily_action_limit: int = field(default_factory=lambda: _env_int("XINS_DAILY_ACTION_LIMIT", 120))
+    session_action_limit: int = field(default_factory=lambda: _env_int("XINS_SESSION_ACTION_LIMIT", 300))
+    min_action_gap_sec: float = field(default_factory=lambda: _env_float("XINS_MIN_ACTION_GAP_SEC", 8.0))
+    slot_jitter: float = field(default_factory=lambda: _env_float("XINS_SLOT_JITTER", 0.35))
+
+    # 每日风控信号预算（auto-download-mode：日级安全网，替代每日动作配额）
+    daily_signal_limit: int = field(default_factory=lambda: _env_int("XINS_DAILY_SIGNAL_LIMIT", 3))
+
+    # 自动模式（auto job）
+    auto_page_size: int = field(default_factory=lambda: _env_int("XINS_AUTO_PAGE_SIZE", 12))
+    auto_fail_limit: int = field(default_factory=lambda: _env_int("XINS_AUTO_FAIL_LIMIT", 3))
+    auto_download_concurrency: int = field(default_factory=lambda: _env_int("XINS_AUTO_DOWNLOAD_CONCURRENCY", 3))
+    auto_resume_jitter_sec: float = field(default_factory=lambda: _env_float("XINS_AUTO_RESUME_JITTER_SEC", 300.0))
 
     # 冷却退避（分钟）
     cooldown_steps_min: List[int] = field(

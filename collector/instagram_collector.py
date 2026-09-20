@@ -6,10 +6,11 @@
   （media_type 1/2/8 + image_versions2.candidates 取最大 + video_versions 取最大）。
 - Profile：滚动 + 捕获浏览器自身网络响应（Phase 5 实现）。
 
-采集链路：
-    preview_post → cooldown.check → quota.acquire → session.page（asyncio.Lock 串行）
+采集链路（auto-download-mode 起，名额由调用方负责）：
+    preview_post → cooldown.check → session.page（asyncio.Lock 串行）
                  → 导航（随机抖动）→ detect_signal（命中即停手 + 进入冷却）
                  → 解析 relay store。
+    名额消费在调用方：手动路由 scheduler.acquire_now()；自动任务 scheduler.wait_for_slot()。
 所有错误统一为 CollectorError(kind, status)，路由层按 kind 映射 HTTP（Phase 6）。
 
 只读契约：__all__ 仅公开读取/解析 API，禁止任何写操作（点赞/关注/评论/收藏/分享）。
@@ -27,7 +28,6 @@ from typing import Dict, List, Optional
 
 from collector.browser_session import session
 from collector.config import settings
-from collector.quota import QuotaExceeded, quota
 from collector.safety import CoolDown, cooldown, detect_signal
 
 __all__ = [
@@ -39,6 +39,10 @@ __all__ = [
     "ProfilePost",
     "ProfilePreview",
     "profile_post_resources",
+    "rehydrate_profile_cache",
+    "touch_profile_cache",
+    "profile_cache_nodes",
+    "reset_profile_cache",
 ]
 
 INSTAGRAM_POST_URL = "https://www.instagram.com/p/{shortcode}/"
@@ -57,7 +61,7 @@ _SIGNAL_KIND = {
 
 class CollectorError(Exception):
     """采集层错误。kind: invalid_url | not_found | login_required | rate_limited |
-    quota | cooldown | parse。status: 建议的 HTTP 状态码。"""
+    cooldown | parse。status: 建议的 HTTP 状态码。"""
 
     def __init__(self, kind: str, message: str, status: int = 500):
         self.kind = kind
@@ -175,16 +179,16 @@ def _extract_media_node(html: str, shortcode: str) -> Optional[dict]:
 
 
 async def preview_post(shortcode: str) -> PostPreview:
-    """采集单帖预览（async）。
+    """采集单帖预览（async）。名额由调用方负责（手动 acquire_now / 自动 wait_for_slot）。
 
     Raises CollectorError(kind, status)：
       invalid_url(400) / login_required(401) / rate_limited(429) /
-      quota(429) / cooldown(429) / not_found(404) / parse(502)
+      cooldown(429) / not_found(404) / parse(502)
     """
     if not shortcode or not _SHORTCODE_RE.fullmatch(shortcode):
         raise CollectorError("invalid_url", "Invalid shortcode", 400)
 
-    # 冷却期直接拒（不消耗配额）
+    # 冷却期直接拒（不消耗名额）
     try:
         cooldown.check()
     except CoolDown as exc:
@@ -193,12 +197,6 @@ async def preview_post(shortcode: str) -> PostPreview:
             f"采集冷却中，约 {int(exc.remaining_seconds)}s 后恢复（原因：{exc.reason}）",
             429,
         ) from exc
-
-    # 配额
-    try:
-        quota.acquire()
-    except QuotaExceeded as exc:
-        raise CollectorError("quota", str(exc), 429) from exc
 
     url = INSTAGRAM_POST_URL.format(shortcode=shortcode)
     nav_lo, nav_hi = settings.nav_stabilize
@@ -412,10 +410,10 @@ async def preview_profile(
 
     - 首次 / TTL 失效 / 失活降级：导航 profile + 滚到 need。
     - 加载更多（已 navigated）：复用持久 page，接着滚到 need（续传，只多滚一页）。
-    - 冷却/配额/信号检测同 preview_post。
+    - 冷却/信号检测同 preview_post。名额由调用方负责（手动 acquire_now / 自动 wait_for_slot）。
 
     Raises CollectorError：invalid_url(400) / login_required(401) / rate_limited(429) /
-      quota(429) / cooldown(429) / not_found(404) / parse(502)
+      cooldown(429) / not_found(404) / parse(502)
     """
     username = _extract_profile_username(profile_value)
     bounded_limit = max(1, min(limit or settings.profile_page_size, _PROFILE_MAX_LIMIT))
@@ -430,10 +428,6 @@ async def preview_profile(
             f"采集冷却中，约 {int(exc.remaining_seconds)}s（原因：{exc.reason}）",
             429,
         ) from exc
-    try:
-        quota.acquire()
-    except QuotaExceeded as exc:
-        raise CollectorError("quota", str(exc), 429) from exc
 
     need = cursor + bounded_limit
     now = time.time()
@@ -461,6 +455,8 @@ async def preview_profile(
         "exhausted": entry["exhausted"] if entry else False,
     }
     can_resume = bool(entry and entry.get("navigated"))
+    # 回灌缓存（自动任务恢复）：重新导航时不丢弃已回灌 nodes，重滚到的旧帖由 have_codes 去重
+    keep_on_navigate = bool(entry and entry.get("rehydrated"))
 
     async with session.profile_page(username) as page:
         async def on_response(resp):
@@ -498,8 +494,9 @@ async def preview_profile(
         async def do_navigate_and_scroll():
             """首次 / 降级：导航 profile + 滚到 need（同一持久 page 上 goto）。"""
             nonlocal user_info
-            captured.clear()
-            have_codes.clear()
+            if not keep_on_navigate:  # 回灌缓存时不丢弃（design D7）
+                captured.clear()
+                have_codes.clear()
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(random.uniform(nav_lo, nav_hi))
             signal = detect_signal(url=page.url)
@@ -555,6 +552,46 @@ async def preview_profile(
             404,
         )
     return _build_profile_response(username, entry, cursor, bounded_limit)
+
+
+# ----------------------------- 自动任务挂钩（auto-download-mode D7） -----------------------------
+
+
+def rehydrate_profile_cache(username: str, nodes: List[dict], exhausted: bool) -> None:
+    """把持久化的原始 nodes 回灌 profile 缓存（自动任务恢复路径，design D7）。
+
+    回灌后 cursor 切片与 nodes 对齐；随后的重新导航不丢弃回灌数据
+    （entry["rehydrated"]），页面重滚到的旧帖由 have_codes 去重，新帖追加尾部。
+    """
+    if not nodes:
+        return
+    _profile_cache[username] = {
+        "nodes": list(nodes),
+        "end_cursor": None,
+        "exhausted": bool(exhausted),
+        "fetched_at": time.time(),
+        "user_info": {},
+        "navigated": False,
+        "rehydrated": True,
+    }
+
+
+def touch_profile_cache(username: str) -> None:
+    """刷新缓存 TTL（自动任务活跃期保温，避免被 TTL 淘汰后深翻页重滚）。"""
+    entry = _profile_cache.get(username)
+    if entry is not None:
+        entry["fetched_at"] = time.time()
+
+
+def reset_profile_cache(username: str) -> None:
+    """丢弃该 username 的 profile 缓存（自动任务增量刷新：强制全新捕获保证时间线顺序）。"""
+    _profile_cache.pop(username, None)
+
+
+def profile_cache_nodes(username: str) -> List[dict]:
+    """读取当前缓存原始 nodes 的浅拷贝（自动任务 nodes 边车增量落盘用）。"""
+    entry = _profile_cache.get(username)
+    return list(entry["nodes"]) if entry else []
 
 
 def _filter_resources(

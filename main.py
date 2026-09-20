@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from collector.auto_job import AutoJobError, AutoJobManager
 from collector.browser_session import session
 from collector.config import settings as collector_settings
 from collector.instagram_collector import (
@@ -37,12 +38,18 @@ from collector.instagram_collector import (
     preview_profile,
     profile_post_resources,
 )
+from collector.quota import QuotaExceeded, scheduler
+from collector.threads_collector import (
+    preview_threads_profile,
+    threads_post_resources,
+)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # session 懒启动：未被采集路由使用前不拉起浏览器，未用不占资源
     yield
+    await auto_manager.shutdown()
     await session.stop()
 
 
@@ -59,6 +66,7 @@ app.add_middleware(
 
 DOWNLOAD_ROOT = Path("downloads")
 FRONTEND_DIST = Path("frontend/dist")
+auto_manager = AutoJobManager(DOWNLOAD_ROOT)
 ALLOWED_MEDIA_HOST_SUFFIXES = ("cdninstagram.com", "fbcdn.net")
 PROFILE_DEFAULT_LIMIT = 6
 PROFILE_MAX_LIMIT = 24
@@ -152,8 +160,30 @@ class ProfileDownloadResponse(BaseModel):
     files: List[str]
 
 
+class AutoStartRequest(BaseModel):
+    profile: str
+    max_posts: Optional[int] = Field(default=None, gt=0)  # 本次最多处理新帖数；缺省不限
+
+
+class AutoStartResponse(BaseModel):
+    job_id: str
+    username: str
+    state: str
+
+
 def _map_collector_error(exc: CollectorError) -> HTTPException:
     return HTTPException(status_code=exc.status, detail=str(exc))
+
+
+def _acquire_manual_slot() -> None:
+    """手动路径：立即执行但消耗调度器窗口名额（auto-download-mode design D4）。
+
+    手动操作不进日程排队；满窗（名义时长未过）→ 429。
+    """
+    try:
+        scheduler.acquire_now()
+    except QuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
 
 
 def _resource_to_media_item(r: PostResource) -> MediaItem:
@@ -566,10 +596,13 @@ async def preview(req: PreviewRequest):
             shortcode = extract_shortcode(req.url)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        _acquire_manual_slot()
         try:
             return _post_preview_to_response(await preview_post(shortcode))
         except CollectorError as e:
             raise _map_collector_error(e)
+        finally:
+            scheduler.report_finish()
 
     # instaloader 应急兜底：仅当人工关闭 collector 且显式开启 fallback（仅单帖）
     if not collector_settings.enable_instaloader_fallback:
@@ -616,12 +649,17 @@ async def media_proxy(url: str = Query(...)):
 async def profile_preview(req: ProfilePreviewRequest):
     if not collector_settings.use_collector:
         raise HTTPException(status_code=503, detail="Profile 采集仅支持浏览器方案（collector），不提供 instaloader 兜底")
+    _acquire_manual_slot()
     try:
         return _profile_preview_to_response(await preview_profile(req.profile, req.cursor, req.limit))
+    except HTTPException:
+        raise
     except CollectorError as e:
         raise _map_collector_error(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Profile preview failed: {type(e).__name__}: {e}")
+    finally:
+        scheduler.report_finish()
 
 
 @app.post("/profile/download", response_model=ProfileDownloadResponse)
@@ -633,6 +671,7 @@ async def profile_download(req: ProfileDownloadRequest):
         if not collector_settings.use_collector:
             raise HTTPException(status_code=503, detail="Profile 下载仅支持浏览器方案（collector），不提供 instaloader 兜底")
 
+        _acquire_manual_slot()
         folder = DOWNLOAD_ROOT / f"profile_{username}"
         folder.mkdir(parents=True, exist_ok=True)
         saved_files = []
@@ -646,6 +685,7 @@ async def profile_download(req: ProfileDownloadRequest):
                 output_path = folder / r.filename
                 await download_file(r.url, output_path)
                 saved_files.append(str(output_path).replace("\\", "/"))
+        scheduler.report_finish()
 
         if not saved_files:
             raise HTTPException(status_code=400, detail="No selected media found")
@@ -667,12 +707,76 @@ async def profile_download(req: ProfileDownloadRequest):
         raise HTTPException(status_code=500, detail=f"Profile download failed: {type(e).__name__}: {e}")
 
 
+@app.post("/threads/profile/preview", response_model=ProfilePreviewResponse)
+async def threads_profile_preview(req: ProfilePreviewRequest):
+    if not collector_settings.use_collector:
+        raise HTTPException(status_code=503, detail="Threads 采集仅支持浏览器方案（collector）")
+    _acquire_manual_slot()
+    try:
+        return _profile_preview_to_response(await preview_threads_profile(req.profile, req.cursor, req.limit))
+    except HTTPException:
+        raise
+    except CollectorError as e:
+        raise _map_collector_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Threads profile preview failed: {type(e).__name__}: {e}")
+    finally:
+        scheduler.report_finish()
+
+
+@app.post("/threads/profile/download", response_model=ProfileDownloadResponse)
+async def threads_profile_download(req: ProfileDownloadRequest):
+    try:
+        username = req.username.strip().lstrip("@")
+        if not req.items:
+            raise HTTPException(status_code=400, detail="No posts selected")
+        if not collector_settings.use_collector:
+            raise HTTPException(status_code=503, detail="Threads 下载仅支持浏览器方案（collector）")
+
+        _acquire_manual_slot()
+        folder = DOWNLOAD_ROOT / f"threads_{username}"
+        folder.mkdir(parents=True, exist_ok=True)
+        saved_files = []
+
+        for selected_post in req.items:
+            code = selected_post.shortcode.strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", code):
+                raise HTTPException(status_code=400, detail=f"Invalid code: {code}")
+            resources = await threads_post_resources(username, code, selected_post.selected_indices)
+            for r in resources:
+                output_path = folder / r.filename
+                await download_file(r.url, output_path)
+                saved_files.append(str(output_path).replace("\\", "/"))
+        scheduler.report_finish()
+
+        if not saved_files:
+            raise HTTPException(status_code=400, detail="No selected media found")
+
+        return ProfileDownloadResponse(
+            status="done",
+            username=username,
+            folder=str(folder).replace("\\", "/"),
+            files=saved_files,
+        )
+
+    except HTTPException:
+        raise
+    except CollectorError as e:
+        raise _map_collector_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Threads profile download failed: {type(e).__name__}: {e}")
+
+
 @app.post("/download", response_model=DownloadResponse)
 async def download(req: DownloadRequest):
     try:
         if collector_settings.use_collector:
             shortcode = extract_shortcode(req.url)
-            preview_data = _post_preview_to_response(await preview_post(shortcode))
+            _acquire_manual_slot()
+            try:
+                preview_data = _post_preview_to_response(await preview_post(shortcode))
+            finally:
+                scheduler.report_finish()
         elif collector_settings.enable_instaloader_fallback:
             preview_data = preview_instagram_post(req.url)
         else:
@@ -713,6 +817,50 @@ async def download(req: DownloadRequest):
         raise_instagram_http_error(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"下载失败：{type(e).__name__}: {e}")
+
+
+# ----------------------------- 自动模式（auto-download-mode） -----------------------------
+
+
+@app.post("/profile/auto", response_model=AutoStartResponse, status_code=202)
+async def profile_auto_start(req: AutoStartRequest):
+    """启动自动任务：后台按调度器日程翻页采集并下载该用户全部内容。"""
+    try:
+        username = extract_profile_username(req.profile)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        job = await auto_manager.start(username, req.max_posts)
+    except AutoJobError as e:
+        if e.kind == "active_job":
+            active = auto_manager.active_job()
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(e), "job_id": active.job_id if active else None},
+            )
+        raise HTTPException(status_code=400, detail=str(e))  # manifest_corrupt 等
+    return AutoStartResponse(job_id=job.job_id, username=username, state=job.state)
+
+
+@app.get("/profile/auto/jobs/{job_id}")
+async def profile_auto_status(job_id: str):
+    """任务状态/进度（specs/auto-download Progress observability）。"""
+    job = auto_manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job 不存在（后端重启后注册表清空，可重新启动续跑）")
+    return job.status_dict()
+
+
+@app.post("/profile/auto/jobs/{job_id}/cancel")
+async def profile_auto_cancel(job_id: str):
+    """取消任务：置取消标志，当前动作与页内下载完成后退出；清单保留可增量续跑。"""
+    job = auto_manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    if job.is_terminal:
+        return {"status": job.state}
+    job.request_cancel()
+    return {"status": "cancelling"}
 
 
 if FRONTEND_DIST.exists():

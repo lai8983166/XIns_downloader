@@ -1,15 +1,16 @@
-"""Phase 2 单元验证：quota + safety（纯逻辑，不联网，不依赖 pytest）。
+"""单元验证：safety 信号检测 + 冷却状态机 + 每日信号预算（纯逻辑，不联网，不依赖 pytest）。
 
+quota 计数器测试已随 QuotaGuard→ActionScheduler 迁移至 test_scheduler.py。
 运行：python test_safety_quota.py
 """
 from __future__ import annotations
 
 import sys
 import time
+from datetime import date, timedelta
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from collector.quota import QuotaExceeded, QuotaGuard
 from collector.safety import (
     SIGNAL_CHALLENGE,
     SIGNAL_LOGIN_WALL,
@@ -45,36 +46,7 @@ def raises(fn, exc_type) -> bool:
 
 
 def main() -> int:
-    print("=== QuotaGuard ===")
-    q = QuotaGuard(session_window_minutes=60, session_action_limit=3, daily_action_limit=100)
-    ok("初始 session_used=0", q.status().session_used == 0)
-    for _ in range(3):
-        q.acquire()
-    ok("达到 session 上限后第 4 次抛 QuotaExceeded", raises(lambda: q.acquire(), QuotaExceeded))
-    try:
-        q.acquire()
-    except QuotaExceeded as e:
-        ok("超 session 时 kind=session", e.kind == "session")
-    ok("status 反映已用 3 次", q.status().session_used == 3)
-
-    # 窗口过期后释放（用极短窗口）
-    qw = QuotaGuard(session_window_minutes=0.01, session_action_limit=1, daily_action_limit=100)
-    qw.acquire()
-    ok("极短窗口内第 2 次抛 QuotaExceeded", raises(lambda: qw.acquire(), QuotaExceeded))
-    time.sleep(1)  # > 0.6s 窗口
-    ok("窗口过期后第 2 次 acquire 成功", not raises(lambda: qw.acquire(), QuotaExceeded))
-
-    # 每日上限
-    qd = QuotaGuard(session_window_minutes=60, session_action_limit=1000, daily_action_limit=2)
-    qd.acquire()
-    qd.acquire()
-    ok("达到每日上限后第 3 次抛 QuotaExceeded", raises(lambda: qd.acquire(), QuotaExceeded))
-    try:
-        qd.acquire()
-    except QuotaExceeded as e:
-        ok("超 daily 时 kind=daily", e.kind == "daily")
-
-    print("\n=== detect_signal ===")
+    print("=== detect_signal ===")
     ok("HTTP 429 → rate_limited", detect_signal(status=429) == SIGNAL_RATE_LIMITED)
     ok("限流短语 → rate_limited", detect_signal(body="Please wait a few minutes before you try again") == SIGNAL_RATE_LIMITED)
     ok("/challenge → challenge", detect_signal(url="https://www.instagram.com/challenge/xyz") == SIGNAL_CHALLENGE)
@@ -102,6 +74,20 @@ def main() -> int:
     c3._last_signal_at = time.time() - 25 * 3600  # 模拟 25 小时无信号
     secs = c3.report(SIGNAL_RATE_LIMITED)  # 重置后从档位 0 开始 → 600
     ok("连续 24h 无信号后档位归零（重回 600s）", secs == 600)
+
+    print("\n=== 每日风控信号预算（auto-download-mode） ===")
+    c4 = CooldownState(steps_min=[10], max_minutes=360)
+    ok("初始当日计数 0", c4.daily_signal_status()["count"] == 0)
+    c4.report(SIGNAL_RATE_LIMITED)
+    c4.report(SIGNAL_CHALLENGE)
+    sig = c4.daily_signal_status()
+    ok("两次 report 后 count=2", sig["count"] == 2)
+    ok("status 带 limit（来自 settings.daily_signal_limit）", sig["limit"] >= 1)
+    # 跨日重置：伪造 _signal_day 为昨天
+    c4._signal_day = date.today() - timedelta(days=1)
+    ok("跨日后计数归零", c4.daily_signal_status()["count"] == 0)
+    c4.report(SIGNAL_RATE_LIMITED)
+    ok("跨日后的新 report 重新从 1 计数", c4.daily_signal_status()["count"] == 1)
 
     print(f"\n===== 结果：{_passed} 通过，{_failed} 失败 =====")
     return 0 if _failed == 0 else 1
