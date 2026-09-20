@@ -171,6 +171,12 @@ class AutoStartResponse(BaseModel):
     state: str
 
 
+class ReviewActionRequest(BaseModel):
+    folder: str
+    filename: str
+    action: Literal["keep", "candidate", "delete"]
+
+
 def _map_collector_error(exc: CollectorError) -> HTTPException:
     return HTTPException(status_code=exc.status, detail=str(exc))
 
@@ -863,5 +869,104 @@ async def profile_auto_cancel(job_id: str):
     return {"status": "cancelling"}
 
 
+# ----------------------------- 媒体审查（media-review-mode） -----------------------------
+
+REVIEW_MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+_REVIEW_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _review_folder_path(folder: str) -> Path:
+    """审查 folder 校验：单段安全名 + resolve 归位到 DOWNLOAD_ROOT 内（design D2）。"""
+    if not folder or not _REVIEW_NAME_RE.fullmatch(folder) or folder.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    root = DOWNLOAD_ROOT.resolve()
+    path = (DOWNLOAD_ROOT / folder).resolve()
+    if not path.is_relative_to(root):
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail="Folder not found")
+    return path
+
+
+def _review_file_path(folder: Path, filename: str) -> Path:
+    """审查 filename 校验：拒绝分隔符/`.` 开头/穿越，归位到 folder 内。"""
+    if not filename or not _REVIEW_NAME_RE.fullmatch(filename) or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = (folder / filename).resolve()
+    if not path.is_relative_to(folder):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return path
+
+
+def _review_files_in(folder: Path) -> List[dict]:
+    files = []
+    for f in sorted(folder.iterdir(), key=lambda p: p.name):
+        if not f.is_file() or f.name.startswith("."):
+            continue
+        suffix = f.suffix.lower()
+        if suffix not in REVIEW_MEDIA_EXTENSIONS:
+            continue
+        files.append({
+            "filename": f.name,
+            "type": "video" if suffix in {".mp4", ".mov"} else "image",
+            "size": f.stat().st_size,
+        })
+    return files
+
+
+@app.get("/review/folders")
+async def review_folders():
+    """列出可审查文件夹（profile_*/threads_* 且含媒体文件）。"""
+    folders = []
+    if DOWNLOAD_ROOT.is_dir():
+        for entry in sorted(DOWNLOAD_ROOT.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or entry.name.startswith((".", "_")):
+                continue
+            if not (entry.name.startswith("profile_") or entry.name.startswith("threads_")):
+                continue
+            count = len(_review_files_in(entry))
+            if count > 0:
+                folders.append({"name": entry.name, "file_count": count})
+    return {"folders": folders}
+
+
+@app.get("/review/files")
+async def review_files(folder: str = Query(...)):
+    """列出文件夹顶层待审媒体文件（排除清单/边车/子目录，design D3）。"""
+    path = _review_folder_path(folder)
+    return {"folder": folder, "files": _review_files_in(path)}
+
+
+@app.post("/review/action")
+async def review_action(req: ReviewActionRequest):
+    """三档动作即时执行：keep 空操作 / candidate 移入 _candidate/ / delete 硬删（不可撤销）。"""
+    folder_path = _review_folder_path(req.folder)
+    file_path = _review_file_path(folder_path, req.filename)
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在（可能已被移动或删除）")
+    if req.action == "candidate":
+        target_dir = folder_path / "_candidate"
+        target_dir.mkdir(exist_ok=True)
+        target = target_dir / req.filename
+        if target.exists():
+            raise HTTPException(status_code=409, detail="_candidate/ 中已存在同名文件")
+        os.replace(file_path, target)
+    elif req.action == "delete":
+        os.remove(file_path)
+    remaining = len(_review_files_in(folder_path))
+    label = {"keep": "kept", "candidate": "moved", "delete": "deleted"}[req.action]
+    return {
+        "status": label,
+        "folder": req.folder,
+        "filename": req.filename,
+        "action": req.action,
+        "remaining": remaining,
+    }
+
+
 if FRONTEND_DIST.exists():
     app.mount("/app", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+
+# 审查本地文件服务（design D3）：Content-Type/ETag/Range（视频拖动）白送，StaticFiles 自拒穿越
+DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+app.mount("/review/file", StaticFiles(directory=DOWNLOAD_ROOT), name="review-files")

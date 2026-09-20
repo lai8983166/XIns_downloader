@@ -15,6 +15,8 @@ const AUTO_STATE_LABELS = {
   cancelled: "已取消",
 };
 
+const REVIEW_ACTION_LABELS = { keep: "保留", candidate: "移入候选", delete: "删除" };
+
 function proxiedMediaUrl(mediaUrl) {
   if (!mediaUrl) {
     return "";
@@ -43,6 +45,10 @@ function formatClock(iso) {
   return new Date(iso).toLocaleTimeString();
 }
 
+function reviewFileUrl(folder, filename) {
+  return `${API_BASE}/review/file/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
+}
+
 function App() {
   const [mode, setMode] = useState("post");
   const [platform, setPlatform] = useState("ig");
@@ -56,6 +62,14 @@ function App() {
   const [autoJobId, setAutoJobId] = useState(null);
   const [autoStatus, setAutoStatus] = useState(null);
   const [autoStarting, setAutoStarting] = useState(false);
+  const [reviewFolders, setReviewFolders] = useState([]);
+  const [reviewFolder, setReviewFolder] = useState("");
+  const [reviewFiles, setReviewFiles] = useState([]);
+  const [reviewTotal, setReviewTotal] = useState(0);
+  const [reviewIndex, setReviewIndex] = useState(0);
+  const [reviewView, setReviewView] = useState("stage");
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewCounts, setReviewCounts] = useState({ keep: 0, candidate: 0, delete: 0 });
   const [lightbox, setLightbox] = useState(null);
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
@@ -119,6 +133,50 @@ function App() {
     };
   }, [autoJobId, autoTerminal]);
 
+  // ---- 审查模式（media-review-mode）：位于 effectiveMode 声明之后，避免 TDZ ----
+  const reviewActive = effectiveMode === "review" && reviewFolder && reviewFiles.length > 0;
+
+  // 进入审查模式时拉取文件夹列表
+  useEffect(() => {
+    if (effectiveMode !== "review" || reviewFolders.length > 0) {
+      return;
+    }
+    fetch(`${API_BASE}/review/folders`)
+      .then((r) => (r.ok ? r.json() : { folders: [] }))
+      .then((d) => setReviewFolders(d.folders ?? []))
+      .catch(() => setReviewFolders([]));
+  }, [effectiveMode, reviewFolders.length]);
+
+  // 动作移除文件后夹紧索引
+  useEffect(() => {
+    setReviewIndex((i) => Math.min(i, Math.max(0, reviewFiles.length - 1)));
+  }, [reviewFiles.length]);
+
+  // 审查键盘流：1/2/3 判定并前进、←/→ 切换、G 网格总览（每渲染重绑，闭包恒新）
+  useEffect(() => {
+    if (!reviewActive) {
+      return undefined;
+    }
+    function onKeyDown(event) {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement) {
+        return;
+      }
+      if (event.key === "ArrowLeft") {
+        setReviewIndex((i) => Math.max(0, i - 1));
+      } else if (event.key === "ArrowRight") {
+        setReviewIndex((i) => Math.min(reviewFiles.length - 1, i + 1));
+      } else if (event.key === "1" || event.key === "2" || event.key === "3") {
+        event.preventDefault();
+        reviewAct(event.key === "1" ? "keep" : event.key === "2" ? "candidate" : "delete");
+      } else if (event.key.toLowerCase() === "g") {
+        setReviewView((v) => (v === "stage" ? "grid" : "stage"));
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   async function requestJson(path, body) {
     const response = await fetch(`${API_BASE}${path}`, {
       method: "POST",
@@ -140,12 +198,20 @@ function App() {
     setPostSelected(new Set());
     setProfileSelected(new Set());
     setLightbox(null);
+    setReviewFolder("");
+    setReviewFiles([]);
+    setReviewTotal(0);
+    setReviewIndex(0);
+    setReviewView("stage");
+    setReviewCounts({ keep: 0, candidate: 0, delete: 0 });
     setStatus(
       nextMode === "profile"
         ? "输入用户名或主页链接后分页预览。"
         : nextMode === "auto"
           ? "输入 Instagram 用户主页链接，启动后自动翻页下载全部内容。"
-          : "输入帖子链接后预览图片。"
+          : nextMode === "review"
+            ? "选择一个文件夹开始审查：1 保留 / 2 候选 / 3 删除。"
+            : "输入帖子链接后预览图片。"
     );
   }
 
@@ -177,7 +243,67 @@ function App() {
       await startAutoJob();
       return;
     }
+    if (effectiveMode === "review") {
+      if (reviewFolder) {
+        await loadReviewFiles(reviewFolder); // 刷新（重载文件列表）
+      }
+      return;
+    }
     await loadPostPreview();
+  }
+
+  async function loadReviewFiles(folder) {
+    if (!folder) {
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/review/files?folder=${encodeURIComponent(folder)}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setStatus(typeof data.detail === "string" ? data.detail : "加载文件列表失败");
+        return;
+      }
+      const files = data.files ?? [];
+      setReviewFolder(folder);
+      setReviewFiles(files);
+      setReviewTotal(files.length);
+      setReviewIndex(0);
+      setReviewView("stage");
+      setReviewCounts({ keep: 0, candidate: 0, delete: 0 });
+      setStatus(`已加载 ${folder}：${files.length} 个待审文件（键盘 1 保留 / 2 候选 / 3 删除）`);
+    } catch (error) {
+      setStatus(`加载失败：${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function reviewAct(action) {
+    const file = reviewFiles[reviewIndex];
+    if (!file || reviewBusy) {
+      return;
+    }
+    setReviewBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/review/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder: reviewFolder, filename: file.filename, action }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setStatus(typeof data.detail === "string" ? data.detail : "操作失败");
+        return;
+      }
+      setReviewFiles((list) => list.filter((f) => f.filename !== file.filename));
+      setReviewCounts((c) => ({ ...c, [action]: c[action] + 1 }));
+      setStatus(`已${REVIEW_ACTION_LABELS[action] ?? action}：${file.filename}`);
+    } catch (error) {
+      setStatus(`操作失败：${error.message}`);
+    } finally {
+      setReviewBusy(false);
+    }
   }
 
   async function startAutoJob() {
@@ -448,23 +574,48 @@ function App() {
               >
                 自动
               </button>
+              <button
+                className={mode === "review" ? "modeButton active" : "modeButton"}
+                type="button"
+                onClick={() => handleModeChange("review")}
+              >
+                审查
+              </button>
             </div>
           )}
-          <input
-            className="urlInput"
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            placeholder={
-              isThreads
-                ? "输入 Threads 用户名或主页链接"
-                : effectiveMode === "post"
-                  ? "粘贴 Instagram 帖子、Reel 或 TV 链接"
-                  : "输入用户名或主页链接"
-            }
-            aria-label={
-              isThreads ? "Threads 用户名" : effectiveMode === "post" ? "Instagram 链接" : "Instagram 用户名"
-            }
-          />
+          {effectiveMode === "review" ? (
+            <select
+              className="urlInput"
+              value={reviewFolder}
+              onChange={(event) => loadReviewFiles(event.target.value)}
+              aria-label="选择审查文件夹"
+            >
+              <option value="">
+                选择文件夹（{reviewFolders.length} 个可用）
+              </option>
+              {reviewFolders.map((f) => (
+                <option key={f.name} value={f.name}>
+                  {f.name}（{f.file_count} 个待审）
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="urlInput"
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              placeholder={
+                isThreads
+                  ? "输入 Threads 用户名或主页链接"
+                  : effectiveMode === "post"
+                    ? "粘贴 Instagram 帖子、Reel 或 TV 链接"
+                    : "输入用户名或主页链接"
+              }
+              aria-label={
+                isThreads ? "Threads 用户名" : effectiveMode === "post" ? "Instagram 链接" : "Instagram 用户名"
+              }
+            />
+          )}
           {effectiveMode === "profile" && (
             <input
               className="urlInput"
@@ -490,9 +641,13 @@ function App() {
             />
           )}
           <button className="primaryButton" disabled={loading || autoStarting} type="submit">
-            {effectiveMode === "auto" ? (autoStarting ? "启动中" : "启动") : loading ? "获取中" : "确认"}
+            {effectiveMode === "auto"
+              ? autoStarting ? "启动中" : "启动"
+              : effectiveMode === "review"
+                ? loading ? "加载中" : "刷新"
+                : loading ? "获取中" : "确认"}
           </button>
-          {effectiveMode !== "auto" && (
+          {effectiveMode !== "auto" && effectiveMode !== "review" && (
             <button className="downloadButton" disabled={canDownload} type="button" onClick={handleDownload}>
               {downloading ? "下载中" : "下载"}
             </button>
@@ -528,7 +683,20 @@ function App() {
           </div>
         )}
 
-        {effectiveMode === "auto" ? (
+        {effectiveMode === "review" ? (
+          <ReviewPanel
+            folder={reviewFolder}
+            files={reviewFiles}
+            index={reviewIndex}
+            total={reviewTotal}
+            counts={reviewCounts}
+            view={reviewView}
+            busy={reviewBusy}
+            onAct={reviewAct}
+            onJump={setReviewIndex}
+            onToggleView={() => setReviewView((v) => (v === "stage" ? "grid" : "stage"))}
+          />
+        ) : effectiveMode === "auto" ? (
           <AutoJobPanel jobId={autoJobId} status={autoStatus} onCancel={cancelAutoJob} />
         ) : effectiveMode === "post" ? (
           <MediaGrid
@@ -574,6 +742,116 @@ function App() {
         </div>
       )}
     </main>
+  );
+}
+
+function ReviewPanel({ folder, files, index, total, counts, view, busy, onAct, onJump, onToggleView }) {
+  if (!folder) {
+    return (
+      <div className="emptyState">
+        <div className="emptyMark">审</div>
+        <p>在上方选择一个文件夹开始审查：1 保留 / 2 候选（移入 _candidate/）/ 3 删除（不可恢复）</p>
+      </div>
+    );
+  }
+
+  const done = total - files.length;
+  const percent = total > 0 ? Math.round((done / total) * 100) : 100;
+
+  if (files.length === 0) {
+    return (
+      <div className="autoPanel">
+        <div className="autoHeader">
+          <span className="stateChip stateTerminal">审查完毕</span>
+          <strong>{folder}</strong>
+        </div>
+        <div className="autoCounts">
+          <span>保留 {counts.keep}</span>
+          <span>候选 {counts.candidate}（在 _candidate/）</span>
+          <span>删除 {counts.delete}</span>
+        </div>
+        <p className="autoDoneHint">本文件夹已全部过完；有新增内容时点「刷新」重新加载。</p>
+      </div>
+    );
+  }
+
+  const current = files[Math.min(index, files.length - 1)];
+  const src = reviewFileUrl(folder, current.filename);
+
+  return (
+    <div className="autoPanel reviewPanel">
+      <div className="autoHeader">
+        <span className="stateChip stateActive">审查中</span>
+        <strong>{folder}</strong>
+        <span>已审 {done}/{total} · 剩余 {files.length}</span>
+        <span>保留 {counts.keep} · 候选 {counts.candidate} · 删除 {counts.delete}</span>
+      </div>
+      <div className="autoProgress">
+        <div className="autoProgressLabel">
+          <span>{percent}%</span>
+        </div>
+        <div className="autoProgressBar">
+          <div className="autoProgressFill" style={{ width: `${percent}%` }} />
+        </div>
+      </div>
+
+      {view === "stage" ? (
+        <div className="reviewStage">
+          {current.type === "video" ? (
+            <video className="reviewMedia" src={src} controls />
+          ) : (
+            <img className="reviewMedia" src={src} alt={current.filename} />
+          )}
+          <div className="reviewFileLine">
+            <span>{current.filename}</span>
+            <span>第 {Math.min(index, files.length - 1) + 1}/{files.length} 个待审</span>
+          </div>
+          <div className="reviewActions">
+            <button className="reviewKeep" disabled={busy} type="button" onClick={() => onAct("keep")}>
+              保留 (1)
+            </button>
+            <button className="reviewCandidate" disabled={busy} type="button" onClick={() => onAct("candidate")}>
+              候选 (2)
+            </button>
+            <button className="reviewDelete" disabled={busy} type="button" onClick={() => onAct("delete")}>
+              删除 (3) · 不可恢复
+            </button>
+          </div>
+          <div className="reviewHint">1/2/3 判定并自动前进 · ←/→ 切换 · G 网格总览</div>
+        </div>
+      ) : (
+        <>
+          <div className="mediaGrid">
+            {files.map((f, i) => (
+              <button
+                className={`mediaCard reviewCard ${i === index ? "reviewCardCurrent" : ""}`}
+                key={f.filename}
+                type="button"
+                onClick={() => {
+                  onJump(i);
+                  onToggleView();
+                }}
+              >
+                <div className="imageWrap">
+                  {f.type === "video" ? (
+                    <video src={reviewFileUrl(folder, f.filename)} muted preload="metadata" />
+                  ) : (
+                    <img src={reviewFileUrl(folder, f.filename)} alt={f.filename} loading="lazy" />
+                  )}
+                  {f.type === "video" && <span className="typeBadge">VIDEO</span>}
+                </div>
+                <div className="reviewCardLabel">{f.filename}</div>
+              </button>
+            ))}
+          </div>
+          <div className="loadMoreRow">
+            <button className="secondaryButton" type="button" onClick={onToggleView}>
+              返回大图审查
+            </button>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 

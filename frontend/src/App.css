@@ -535,3 +535,103 @@ input {
   color: #6b7688;
   font-size: 13px;
 }
+
+/* ---------- 审查模式（media-review-mode） ---------- */
+
+.reviewStage {
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  padding: 8px 0 4px;
+}
+
+.reviewMedia {
+  max-width: 100%;
+  max-height: min(72vh, 900px);
+  border-radius: 10px;
+  background: #0f141c;
+  object-fit: contain;
+}
+
+.reviewFileLine {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  color: #627083;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.reviewActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.reviewActions button {
+  height: 46px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 22px;
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+  transition: transform 0.16s ease, opacity 0.16s ease;
+}
+
+.reviewActions button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.reviewActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.reviewKeep {
+  background: #1f9d61;
+  box-shadow: 0 8px 20px rgba(31, 157, 97, 0.25);
+}
+
+.reviewCandidate {
+  background: #d9a406;
+  box-shadow: 0 8px 20px rgba(217, 164, 6, 0.25);
+}
+
+.reviewDelete {
+  background: #d64545;
+  box-shadow: 0 8px 20px rgba(214, 69, 69, 0.25);
+}
+
+.reviewHint {
+  color: #8a94a6;
+  font-size: 12px;
+}
+
+.imageWrap video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.reviewCard {
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.reviewCardCurrent {
+  outline: 3px solid #ff5c7c;
+}
+
+.reviewCardLabel {
+  padding: 8px 10px;
+  color: #445268;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

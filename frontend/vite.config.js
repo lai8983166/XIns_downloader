@@ -13,7 +13,8 @@ export default defineConfig({
       "/download": apiTarget,
       "/media-proxy": apiTarget,
       "/profile": apiTarget,
-      "/threads": apiTarget
+      "/threads": apiTarget,
+      "/review": apiTarget
     }
   }
 });
