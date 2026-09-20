@@ -347,6 +347,16 @@ def main_sync(tmp: Path) -> None:
     m = _Manifest(folder2)
     m.load("userY")
     ok("边车末行半写被容忍（读到 1 个）", len(m.nodes) == 1)
+    healed = (folder2 / ".auto_nodes.jsonl").read_text(encoding="utf-8")
+    ok("半行丢弃后自愈重写（1 行且换行结尾，防 append 粘连）",
+       healed.count("\n") == 1 and healed.endswith("\n"))
+
+    # 回归：caption 含 U+2028 行分隔符（splitlines 误切的根源）→ split("\n") 完好读取
+    node_u = {"code": "U1", "caption": {"text": "clouds and trees more"}}
+    (folder2 / ".auto_nodes.jsonl").write_text(json.dumps(node_u, ensure_ascii=False) + "\n", encoding="utf-8")
+    mu = _Manifest(folder2)
+    mu.load("userY")
+    ok("U+2028 不再误判损坏", len(mu.nodes) == 1 and mu.nodes[0]["code"] == "U1")
 
     (folder2 / ".auto_nodes.jsonl").write_text("{bad json}\n" + good + "\n", encoding="utf-8")  # 中部损坏
     m2 = _Manifest(folder2)

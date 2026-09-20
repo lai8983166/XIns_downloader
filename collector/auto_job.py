@@ -131,11 +131,16 @@ class _Manifest:
         self.data["username"] = username
         if self.nodes_path.exists():
             try:
-                lines = self.nodes_path.read_text(encoding="utf-8").splitlines()
+                raw = self.nodes_path.read_text(encoding="utf-8")
             except OSError as exc:
                 raise AutoJobError(
                     "manifest_corrupt", f"nodes 边车不可读：{self.nodes_path}（{exc}）"
                 ) from exc
+            # 只按真实 \n 切行：str.splitlines 会额外在 U+2028/U+0085 等 Unicode
+            # 行分隔符上切分，而 json.dumps(ensure_ascii=False) 不转义它们——
+            # caption 含这类字符时 splitlines 会把合法 JSONL 误判为损坏行
+            lines = raw.split("\n")
+            needs_normalize = bool(raw) and not raw.endswith("\n")
             for i, line in enumerate(lines):
                 line = line.strip()
                 if not line:
@@ -144,7 +149,7 @@ class _Manifest:
                     node = json.loads(line)
                 except ValueError:
                     if i == len(lines) - 1:
-                        continue  # 末行半写（崩溃残留）→ 容忍丢弃
+                        continue  # 末段无换行且解析失败 → 半写残留，丢弃
                     raise AutoJobError(
                         "manifest_corrupt",
                         f"nodes 边车第 {i + 1} 行损坏：{self.nodes_path}",
@@ -153,6 +158,9 @@ class _Manifest:
                 if code and code not in self._saved_codes:
                     self._saved_codes.add(code)
                     self.nodes.append(node)
+            if needs_normalize:
+                # 末尾无换行：无论末段是否半写，重写归一化，防止后续 append 粘连成损坏行
+                self.rewrite_nodes(self.nodes)
 
     def save(self) -> None:
         """原子落盘（tmp + os.replace，防半写损坏）。"""
