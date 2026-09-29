@@ -1,17 +1,20 @@
 """自动模式：给定 username 后台全量翻页采集 + 下载（design D5-D9 + specs/auto-download）。
 
 链路：
-    AutoJobManager（进程级注册表；全局至多一个活跃任务）
+    AutoJobManager（进程级注册表；全局至多一个活跃任务，跨平台互斥）
       → AutoJob（asyncio Task 状态机）
-          scheduler.wait_for_slot → preview_profile(翻页) → 页内并发下载
+          scheduler.wait_for_slot → adapter.preview(翻页) → 页内并发下载
           → manifest 每帖原子落盘 → touch 缓存保温 + nodes 边车增量 → report_finish
     风控信号 → 采集层已 cooldown.report → 任务 paused_cooldown / paused_signal_budget
     连续非信号失败 ≥ auto_fail_limit → paused_circuit + scheduler.invalidate（人工确认）
 
 状态机：starting → running ⇄ paused_{cooldown,signal_budget,circuit} → done/failed/cancelled
 
-持久化（{download_root}/profile_{username}/，design D5）：
-    .auto_state.json   小清单：posts 状态映射 / cursor / exhausted / failures / 计数
+平台（threads-auto-download D1）：PlatformAdapter 注入翻页采集函数组、缓存挂钩、
+文件夹前缀与边车 code 提取器；instagram / threads 各一实例，IG 行为零变化。
+
+持久化（{download_root}/{prefix}{username}/，design D5）：
+    .auto_state.json   小清单：platform / posts 状态映射 / cursor / exhausted / failures / 计数
     .auto_nodes.jsonl  边车：原始采集 nodes（每行一个，增量 append），恢复时回灌采集层缓存
 损坏（截断/非 JSON）→ 启动报 AutoJobError 并指明文件路径，不静默重采。
 
@@ -29,8 +32,9 @@ import random
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
@@ -47,10 +51,18 @@ from collector.instagram_collector import (
 )
 from collector.quota import scheduler
 from collector.safety import cooldown, daily_signal_status
+from collector.threads_collector import (
+    preview_threads_profile,
+    rehydrate_threads_cache,
+    reset_threads_cache,
+    threads_cache_nodes,
+    threads_node_code,
+    touch_threads_cache,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AutoJobManager", "AutoJob", "AutoJobError"]
+__all__ = ["AutoJobManager", "AutoJob", "AutoJobError", "PlatformAdapter"]
 
 # CollectorError.kind 中属于风控信号的（采集层已 cooldown.report）
 _SIGNAL_KINDS = {"rate_limited", "login_required"}
@@ -63,11 +75,53 @@ _DOWNLOAD_RETRY_BACKOFF = (2.0, 8.0)
 
 
 class AutoJobError(Exception):
-    """启动/管理自动任务失败。kind: active_job | manifest_corrupt。"""
+    """启动/管理自动任务失败。kind: active_job | manifest_corrupt | unknown_platform。"""
 
     def __init__(self, kind: str, message: str):
         self.kind = kind
         super().__init__(message)
+
+
+# ----------------------------- 平台适配（threads-auto-download D1） -----------------------------
+
+
+@dataclass(frozen=True)
+class PlatformAdapter:
+    """自动任务的平台差异面：翻页采集函数组 + 缓存挂钩 + 文件夹前缀 + 边车 code 提取器。"""
+
+    name: str                                  # "instagram" | "threads"
+    folder_prefix: str                         # "profile_" | "threads_"（与手动下载目录一致）
+    preview: Callable[..., Any]                # 翻页采集（受调度/冷却/信号检测保护）
+    rehydrate: Callable[..., None]             # 恢复时回灌采集层缓存
+    touch: Callable[..., None]                 # 活跃期保温（防 TTL 淘汰）
+    reset: Callable[..., None]                 # 增量刷新时丢弃缓存（保证时间线顺序）
+    cache_nodes: Callable[..., List[dict]]     # 读缓存原始 nodes（边车增量落盘）
+    node_code: Callable[[dict], Optional[str]]  # 原始节点 → 帖子 code（边车去重；threads 在嵌套层）
+
+
+instagram_adapter = PlatformAdapter(
+    name="instagram",
+    folder_prefix="profile_",
+    preview=preview_profile,
+    rehydrate=rehydrate_profile_cache,
+    touch=touch_profile_cache,
+    reset=reset_profile_cache,
+    cache_nodes=profile_cache_nodes,
+    node_code=lambda n: n.get("code") if isinstance(n, dict) else None,
+)
+
+threads_adapter = PlatformAdapter(
+    name="threads",
+    folder_prefix="threads_",
+    preview=preview_threads_profile,
+    rehydrate=rehydrate_threads_cache,
+    touch=touch_threads_cache,
+    reset=reset_threads_cache,
+    cache_nodes=threads_cache_nodes,
+    node_code=threads_node_code,
+)
+
+_ADAPTERS: Dict[str, PlatformAdapter] = {a.name: a for a in (instagram_adapter, threads_adapter)}
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -98,13 +152,15 @@ async def _download_file(url: str, output: Path) -> None:
 class _Manifest:
     """任务持久化清单 + nodes 边车（design D5）。损坏即拒载并指明路径。"""
 
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, node_code: Callable[[dict], Optional[str]]):
         self.folder = folder
         self.state_path = folder / ".auto_state.json"
         self.nodes_path = folder / ".auto_nodes.jsonl"
+        self._node_code = node_code  # 平台各自的节点 code 提取器（threads 在嵌套层）
         self.data: Dict[str, Any] = {
             "version": 1,
             "username": "",
+            "platform": "",  # instagram | threads（旧清单无此字段 → load 回填）
             "cursor": 0,
             "exhausted": False,
             "mediacount": None,
@@ -115,7 +171,7 @@ class _Manifest:
         self.nodes: List[dict] = []
         self._saved_codes: set = set()
 
-    def load(self, username: str) -> None:
+    def load(self, username: str, adapter: PlatformAdapter) -> None:
         self.folder.mkdir(parents=True, exist_ok=True)
         if self.state_path.exists():
             try:
@@ -129,6 +185,11 @@ class _Manifest:
                 raise AutoJobError("manifest_corrupt", f"任务清单结构异常：{self.state_path}")
             self.data.update(raw)
         self.data["username"] = username
+        # 旧清单（threads-auto-download 之前仅 IG 落盘）无 platform → 按 instagram 兼容；
+        # 目录前缀按平台隔离，随后按启动平台回写
+        if not self.data.get("platform"):
+            self.data["platform"] = "instagram"
+        self.data["platform"] = adapter.name
         if self.nodes_path.exists():
             try:
                 raw = self.nodes_path.read_text(encoding="utf-8")
@@ -154,7 +215,7 @@ class _Manifest:
                         "manifest_corrupt",
                         f"nodes 边车第 {i + 1} 行损坏：{self.nodes_path}",
                     )
-                code = node.get("code") if isinstance(node, dict) else None
+                code = self._node_code(node) if isinstance(node, dict) else None
                 if code and code not in self._saved_codes:
                     self._saved_codes.add(code)
                     self.nodes.append(node)
@@ -174,38 +235,42 @@ class _Manifest:
         del self.data["failures"][:-_MAX_STATE_FAILURES]
 
     def append_nodes(self, nodes: List[dict]) -> None:
-        """把新捕获的原始 nodes 增量写入边车（按 code 去重）。"""
-        fresh = [
-            n for n in nodes
-            if isinstance(n, dict) and n.get("code") and n["code"] not in self._saved_codes
-        ]
+        """把新捕获的原始 nodes 增量写入边车（按平台 code 提取器去重，含批内重复）。"""
+        fresh = []
+        batch_codes: set = set()
+        for n in nodes:
+            code = self._node_code(n) if isinstance(n, dict) else None
+            if code and code not in self._saved_codes and code not in batch_codes:
+                batch_codes.add(code)
+                fresh.append((code, n))
         if not fresh:
             return
         with open(self.nodes_path, "a", encoding="utf-8") as f:
-            for n in fresh:
+            for code, n in fresh:
                 f.write(json.dumps(n, ensure_ascii=False) + "\n")
-                self._saved_codes.add(n["code"])
+                self._saved_codes.add(code)
                 self.nodes.append(n)
 
     def rewrite_nodes(self, nodes: List[dict]) -> None:
         """用完整快照整写边车（任务收尾；保持时间线顺序，增量刷新后必须）。"""
-        valid = [n for n in nodes if isinstance(n, dict) and n.get("code")]
+        valid = [n for n in nodes if isinstance(n, dict) and self._node_code(n)]
         with open(self.nodes_path, "w", encoding="utf-8") as f:
             for n in valid:
                 f.write(json.dumps(n, ensure_ascii=False) + "\n")
         self.nodes = valid
-        self._saved_codes = {n["code"] for n in valid}
+        self._saved_codes = {self._node_code(n) for n in valid}
 
 
 class AutoJob:
-    """单用户自动任务（状态机 + 翻页-下载-落盘循环）。"""
+    """单用户自动任务（状态机 + 翻页-下载-落盘循环；平台差异经 adapter 注入）。"""
 
-    def __init__(self, username: str, max_posts: Optional[int], download_root: Path):
+    def __init__(self, username: str, max_posts: Optional[int], download_root: Path, adapter: PlatformAdapter):
         self.job_id = uuid.uuid4().hex[:12]
         self.username = username
+        self.adapter = adapter
         self.max_posts = max_posts
-        self.folder = Path(download_root) / f"profile_{username}"
-        self.manifest = _Manifest(self.folder)
+        self.folder = Path(download_root) / f"{adapter.folder_prefix}{username}"
+        self.manifest = _Manifest(self.folder, adapter.node_code)
         self.state = "starting"
         self.paused_reason: Optional[str] = None
         self.resume_at: Optional[float] = None
@@ -225,7 +290,7 @@ class AutoJob:
         return self.state in _TERMINAL_STATES
 
     def start(self) -> None:
-        self._task = asyncio.create_task(self._run(), name=f"auto-{self.username}-{self.job_id}")
+        self._task = asyncio.create_task(self._run(), name=f"auto-{self.adapter.name}-{self.username}-{self.job_id}")
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -253,6 +318,7 @@ class AutoJob:
         return {
             "job_id": self.job_id,
             "username": self.username,
+            "platform": self.adapter.name,
             "state": self.state,
             "paused_reason": self.paused_reason,
             "resume_at": _iso(self.resume_at) if self.state in _PAUSED_STATES else None,
@@ -294,10 +360,10 @@ class AutoJob:
             self._refresh_mode = True
             m["exhausted"] = False
             m["cursor"] = 0
-            reset_profile_cache(self.username)
+            self.adapter.reset(self.username)
         elif self.manifest.nodes:
             # 恢复路径：缓存丢失时回灌已采集 nodes（design D7）
-            rehydrate_profile_cache(self.username, self.manifest.nodes, m["exhausted"])
+            self.adapter.rehydrate(self.username, self.manifest.nodes, m["exhausted"])
         self._set_state("running")
 
         while True:
@@ -320,7 +386,7 @@ class AutoJob:
                 return
 
             try:
-                page = await preview_profile(self.username, cursor=m["cursor"], limit=settings.auto_page_size)
+                page = await self.adapter.preview(self.username, cursor=m["cursor"], limit=settings.auto_page_size)
                 if not page.posts and page.has_more:
                     raise CollectorError("parse", "翻页返回空页（页面异常）", 502)
             except asyncio.CancelledError:
@@ -357,8 +423,8 @@ class AutoJob:
             elif self._refresh_mode and page.posts and page_skips == len(page.posts):
                 # 增量刷新：整页已知帖 → 已达旧覆盖区（新帖只出现在头部，连续区间）
                 m["exhausted"] = True
-            touch_profile_cache(self.username)  # 保温：任务活跃期不被 TTL 淘汰
-            self.manifest.append_nodes(profile_cache_nodes(self.username))
+            self.adapter.touch(self.username)  # 保温：任务活跃期不被 TTL 淘汰
+            self.manifest.append_nodes(self.adapter.cache_nodes(self.username))
             self.manifest.save()
             scheduler.report_finish()
 
@@ -463,7 +529,7 @@ class AutoJob:
     def _snapshot_nodes(self) -> None:
         """收尾：用最终缓存快照整写边车（保持时间线顺序；增量刷新模式必须）。"""
         try:
-            nodes = profile_cache_nodes(self.username)
+            nodes = self.adapter.cache_nodes(self.username)
         except Exception:
             return
         if nodes:
@@ -508,16 +574,22 @@ class AutoJobManager:
         self._jobs: Dict[str, AutoJob] = {}
         self._lock = asyncio.Lock()
 
-    async def start(self, username: str, max_posts: Optional[int] = None) -> AutoJob:
+    async def start(
+        self, username: str, max_posts: Optional[int] = None, platform: str = "instagram"
+    ) -> AutoJob:
         async with self._lock:
             active = self.active_job()
             if active is not None:
+                label = "Threads" if active.adapter.name == "threads" else "Instagram"
                 raise AutoJobError(
                     "active_job",
-                    f"已有活跃任务（{active.username}，job_id={active.job_id}），请等待完成或先取消",
+                    f"已有活跃任务（{label} {active.username}，job_id={active.job_id}），请等待完成或先取消",
                 )
-            job = AutoJob(username, max_posts, self._download_root)
-            job.manifest.load(username)  # 损坏 → AutoJobError，任务不创建
+            adapter = _ADAPTERS.get(platform)
+            if adapter is None:
+                raise AutoJobError("unknown_platform", f"未知平台：{platform}")
+            job = AutoJob(username, max_posts, self._download_root, adapter)
+            job.manifest.load(username, adapter)  # 损坏 → AutoJobError，任务不创建
             job.start()
             self._jobs[job.job_id] = job
             return job

@@ -11,6 +11,10 @@
 采集链路同 IG preview_profile（持久 page 续传 + cooldown/信号检测；名额由调用方负责）。
 复用 IG 的 _scroll_until / _node_to_profile_post / _SIGNAL_KIND / dataclass（post 结构一致）。
 page 池键用 `threads:{username}` 前缀，避免与 IG 同名用户冲突。
+
+自动任务挂钩（threads-auto-download D3）：rehydrate/touch/reset/cache_nodes
+对齐 IG 版语义；回灌条目不恢复 first_req（进程内存态），rehydrated 标志
+保证降级重导航不丢弃回灌 nodes。
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import json
 import random
 import re
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlencode
 
 from collector.browser_session import session
@@ -35,7 +39,18 @@ from collector.instagram_collector import (
 )
 from collector.safety import CoolDown, cooldown, detect_signal
 
-__all__ = ["preview_threads_profile", "threads_post_resources", "ProfilePost", "ProfilePreview"]
+__all__ = [
+    "preview_threads_profile",
+    "threads_post_resources",
+    "extract_threads_username",
+    "threads_node_code",
+    "rehydrate_threads_cache",
+    "touch_threads_cache",
+    "reset_threads_cache",
+    "threads_cache_nodes",
+    "ProfilePost",
+    "ProfilePreview",
+]
 
 THREADS_PROFILE_URL = "https://www.threads.com/@{username}"
 THREADS_GRAPHQL_URL = "https://www.threads.com/graphql/query"
@@ -47,7 +62,7 @@ _threads_cache: Dict[str, dict] = {}
 _TIMELINE_CONN_KEY = "mediaData"
 
 
-def _extract_threads_username(value: str) -> str:
+def extract_threads_username(value: str) -> str:
     v = (value or "").strip()
     if not v:
         raise CollectorError("invalid_url", "Threads username is required", 400)
@@ -75,6 +90,14 @@ def _thread_post(node: dict) -> dict:
 
 def _thread_code(node: dict) -> Optional[str]:
     return _thread_post(node).get("code")
+
+
+def threads_node_code(node: dict) -> Optional[str]:
+    """thread 原始节点取帖子 code（顶层无 code，位于 thread_items[0].post.code）。
+
+    供 auto job 的 nodes 边车去重（与 IG 的 n["code"] 对应）。
+    """
+    return _thread_code(node)
 
 
 def _has_media(post: dict) -> bool:
@@ -171,8 +194,8 @@ async def preview_threads_profile(
     limit: Optional[int] = None,
 ) -> ProfilePreview:
     """采集 Threads 用户主页帖子列表（async，整型 cursor 偏移分页 + 持久 page 续传）。
-    名额由调用方负责（手动路由 acquire_now）。"""
-    username = _extract_threads_username(profile_value)
+    名额由调用方负责（手动路由 acquire_now / 自动任务 wait_for_slot）。"""
+    username = extract_threads_username(profile_value)
     bounded_limit = max(1, min(limit or settings.profile_page_size, _THREADS_MAX_LIMIT))
     if cursor < 0:
         raise CollectorError("invalid_url", "cursor 必须 >= 0", 400)
@@ -210,6 +233,8 @@ async def preview_threads_profile(
         "exhausted": entry["exhausted"] if entry else False,
     }
     can_resume = bool(entry and entry.get("navigated"))
+    # 回灌缓存（自动任务恢复）：重新导航时不丢弃已回灌 nodes，重滚到的旧帖由 have_codes 去重
+    keep_on_navigate = bool(entry and entry.get("rehydrated"))
     first_req = {"post_data": None, "headers": None}
     if entry and entry.get("first_req"):
         first_req["post_data"] = entry["first_req"].get("post_data")
@@ -270,8 +295,9 @@ async def preview_threads_profile(
 
         async def do_navigate_and_fetch():
             nonlocal user_info
-            captured.clear()
-            have_codes.clear()
+            if not keep_on_navigate:  # 回灌缓存时不丢弃（同 IG rehydrated 保护）
+                captured.clear()
+                have_codes.clear()
             first_req["post_data"] = None
             first_req["headers"] = None
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -320,6 +346,9 @@ async def preview_threads_profile(
     _threads_cache[username] = entry
 
     if not captured and not user_info.get("mediacount"):
+        # 零捕获（实测 e2e：持久 page 可能卡在坏 SPA 态，re-goto 不再发首屏 graphql）：
+        # 废弃该持久 page，下次重试用全新页面，而非在同一坏页面上反复导航
+        await session.close_profile_page(pool_key)
         raise CollectorError(
             "not_found",
             "未找到 Threads 内容（用户不存在/私密/页面结构变更）",
@@ -343,3 +372,45 @@ async def threads_post_resources(username: str, code: str, selected_indices=None
                 post = _thread_node_to_post(node, username, 1)
                 return _filter_resources(post.resources if post else [], selected_indices)
     raise CollectorError("not_found", "该 Threads 帖子不在缓存中，请先预览该用户主页", 404)
+
+
+# ----------------------------- 自动任务挂钩（threads-auto-download D3） -----------------------------
+
+
+def rehydrate_threads_cache(username: str, nodes: List[dict], exhausted: bool) -> None:
+    """把持久化的原始 nodes 回灌 threads 缓存（自动任务恢复路径）。
+
+    不恢复 first_req（翻页请求模板是进程内存态，重启即失）：回灌条目
+    navigated=False → 下次 preview 直接重新导航；rehydrated 标志保证重导航
+    不丢弃回灌数据，重滚到的旧帖由 have_codes 去重、新帖追加尾部。
+    """
+    if not nodes:
+        return
+    _threads_cache[username] = {
+        "nodes": list(nodes),
+        "end_cursor": None,
+        "exhausted": bool(exhausted),
+        "fetched_at": time.time(),
+        "user_info": {},
+        "navigated": False,
+        "first_req": {"post_data": None, "headers": None},
+        "rehydrated": True,
+    }
+
+
+def touch_threads_cache(username: str) -> None:
+    """刷新缓存 TTL（自动任务活跃期保温，避免被 TTL 淘汰后深翻页重滚）。"""
+    entry = _threads_cache.get(username)
+    if entry is not None:
+        entry["fetched_at"] = time.time()
+
+
+def reset_threads_cache(username: str) -> None:
+    """丢弃该 username 的 threads 缓存（自动任务增量刷新：强制全新捕获保证时间线顺序）。"""
+    _threads_cache.pop(username, None)
+
+
+def threads_cache_nodes(username: str) -> List[dict]:
+    """读取当前缓存原始 nodes 的浅拷贝（自动任务 nodes 边车增量落盘用）。"""
+    entry = _threads_cache.get(username)
+    return list(entry["nodes"]) if entry else []

@@ -40,6 +40,7 @@ from collector.instagram_collector import (
 )
 from collector.quota import QuotaExceeded, scheduler
 from collector.threads_collector import (
+    extract_threads_username,
     preview_threads_profile,
     threads_post_resources,
 )
@@ -837,6 +838,26 @@ async def profile_auto_start(req: AutoStartRequest):
         raise HTTPException(status_code=400, detail=str(e))
     try:
         job = await auto_manager.start(username, req.max_posts)
+    except AutoJobError as e:
+        if e.kind == "active_job":
+            active = auto_manager.active_job()
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(e), "job_id": active.job_id if active else None},
+            )
+        raise HTTPException(status_code=400, detail=str(e))  # manifest_corrupt 等
+    return AutoStartResponse(job_id=job.job_id, username=username, state=job.state)
+
+
+@app.post("/threads/profile/auto", response_model=AutoStartResponse, status_code=202)
+async def threads_profile_auto_start(req: AutoStartRequest):
+    """启动 Threads 自动任务：与 IG 同一状态机/调度/熔断，清单落 threads_{username}。"""
+    try:
+        username = extract_threads_username(req.profile)
+    except CollectorError as e:
+        raise _map_collector_error(e)
+    try:
+        job = await auto_manager.start(username, req.max_posts, platform="threads")
     except AutoJobError as e:
         if e.kind == "active_job":
             active = auto_manager.active_job()

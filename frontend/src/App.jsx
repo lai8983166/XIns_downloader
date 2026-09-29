@@ -81,8 +81,9 @@ function App() {
   const isThreads = platform === "threads";
   const profilePath = isThreads ? "/threads/profile/preview" : "/profile/preview";
   const profileDownloadPath = isThreads ? "/threads/profile/download" : "/profile/download";
-  // Threads 只有 profile；IG 有 post/profile。effectiveMode 统一判断
-  const effectiveMode = isThreads ? "profile" : mode;
+  const autoStartPath = isThreads ? "/threads/profile/auto" : "/profile/auto";
+  // Threads 无单帖模式（profile/auto/review 可用）；IG 全模式。effectiveMode 统一判断
+  const effectiveMode = isThreads && mode === "post" ? "profile" : mode;
 
   const postResources = postPreview?.resources ?? [];
   const profilePosts = profilePreview?.posts ?? [];
@@ -208,7 +209,7 @@ function App() {
       nextMode === "profile"
         ? "输入用户名或主页链接后分页预览。"
         : nextMode === "auto"
-          ? "输入 Instagram 用户主页链接，启动后自动翻页下载全部内容。"
+          ? `输入${isThreads ? " Threads" : " Instagram"}用户主页链接，启动后自动翻页下载全部内容。`
           : nextMode === "review"
             ? "选择一个文件夹开始审查：1 保留 / 2 候选 / 3 删除。"
             : "输入帖子链接后预览图片。"
@@ -222,7 +223,8 @@ function App() {
 
   function handlePlatformChange(nextPlatform) {
     setPlatform(nextPlatform);
-    if (nextPlatform === "threads") {
+    // Threads 无单帖模式：仅从「单帖」回落 profile，其余模式（profile/auto/review）保留
+    if (nextPlatform === "threads" && mode === "post") {
       setMode("profile");
     }
     setPostPreview(null);
@@ -230,7 +232,11 @@ function App() {
     setPostSelected(new Set());
     setProfileSelected(new Set());
     setLightbox(null);
-    setStatus(nextPlatform === "threads" ? "输入 Threads 用户名后分页预览。" : "输入帖子链接后预览图片。");
+    setStatus(
+      nextPlatform === "threads"
+        ? "输入 Threads 用户名后分页预览，或切「自动」批量下载。"
+        : "输入帖子链接后预览图片。"
+    );
   }
 
   async function handleSubmit(event) {
@@ -309,12 +315,12 @@ function App() {
   async function startAutoJob() {
     const profile = input.trim();
     if (!profile) {
-      setStatus("请输入 Instagram 用户名或主页链接");
+      setStatus(isThreads ? "请输入 Threads 用户名或主页链接" : "请输入 Instagram 用户名或主页链接");
       return;
     }
     setAutoStarting(true);
     try {
-      const response = await fetch(`${API_BASE}/profile/auto`, {
+      const response = await fetch(`${API_BASE}${autoStartPath}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -334,7 +340,7 @@ function App() {
       }
       setAutoStatus(null);
       setAutoJobId(data.job_id);
-      setStatus(`自动任务已启动：@${data.username}，将按拟人日程自动翻页下载`);
+      setStatus(`自动任务已启动：${isThreads ? "Threads" : "Instagram"} @${data.username}，将按拟人日程自动翻页下载`);
     } catch (error) {
       setStatus(`启动失败：${error.message}`);
     } finally {
@@ -551,8 +557,8 @@ function App() {
               Threads
             </button>
           </div>
-          {!isThreads && (
-            <div className="modeSwitch" role="tablist" aria-label="下载模式">
+          <div className="modeSwitch" role="tablist" aria-label="下载模式">
+            {!isThreads && (
               <button
                 className={mode === "post" ? "modeButton active" : "modeButton"}
                 type="button"
@@ -560,29 +566,29 @@ function App() {
               >
                 单帖
               </button>
-              <button
-                className={mode === "profile" ? "modeButton active" : "modeButton"}
-                type="button"
-                onClick={() => handleModeChange("profile")}
-              >
-                Profile
-              </button>
-              <button
-                className={mode === "auto" ? "modeButton active" : "modeButton"}
-                type="button"
-                onClick={() => handleModeChange("auto")}
-              >
-                自动
-              </button>
-              <button
-                className={mode === "review" ? "modeButton active" : "modeButton"}
-                type="button"
-                onClick={() => handleModeChange("review")}
-              >
-                审查
-              </button>
-            </div>
-          )}
+            )}
+            <button
+              className={mode === "profile" ? "modeButton active" : "modeButton"}
+              type="button"
+              onClick={() => handleModeChange("profile")}
+            >
+              Profile
+            </button>
+            <button
+              className={mode === "auto" ? "modeButton active" : "modeButton"}
+              type="button"
+              onClick={() => handleModeChange("auto")}
+            >
+              自动
+            </button>
+            <button
+              className={mode === "review" ? "modeButton active" : "modeButton"}
+              type="button"
+              onClick={() => handleModeChange("review")}
+            >
+              审查
+            </button>
+          </div>
           {effectiveMode === "review" ? (
             <select
               className="urlInput"
@@ -880,6 +886,7 @@ function AutoJobPanel({ jobId, status, onCancel }) {
         <span className={`stateChip ${terminal ? "stateTerminal" : state.startsWith("paused") ? "statePaused" : "stateActive"}`}>
           {stateLabel}
         </span>
+        {status?.platform && <span>{status.platform === "threads" ? "Threads" : "Instagram"}</span>}
         <strong>@{status?.username ?? "…"}</strong>
         {status?.max_posts ? <span>上限 {status.max_posts} 新帖</span> : null}
         <span>job {jobId}</span>

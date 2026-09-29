@@ -90,13 +90,40 @@ async def fake_download(url, output):
     output.write_bytes(b"fake-media")
 
 
-def install_fakes(script, username, nodes_sink=None, rehydrate_sink=None, touches=None):
-    """注入 fake 采集/下载/调度；script 逐次弹出 ProfilePreview 或异常。
+def mk_thread_nodes(codes):
+    """threads 原始节点形状：code 在 thread_items[0].post（顶层无 code）。"""
+    return [
+        {
+            "thread_items": [
+                {
+                    "post": {
+                        "code": c,
+                        "media_type": 1,
+                        "image_versions2": {"candidates": [{"url": f"https://cdn.test/{c}.jpg", "width": 100, "height": 100}]},
+                    }
+                }
+            ]
+        }
+        for c in codes
+    ]
+
+
+def install_fakes(script, username, nodes_sink=None, rehydrate_sink=None, touches=None,
+                  into="instagram", node_code=None, mk_nodes_fn=None):
+    """注入 fake adapter/下载/调度；script 逐次弹出 ProfilePreview 或异常。
 
     nodes_sink 模拟采集层缓存的原始 nodes（跨 install 累积，同真实缓存语义）。
+    into="threads" 时按 threads 节点形状构造（node_code 提取嵌套 code），落 threads_ 前缀。
     """
+    from collector.threads_collector import threads_node_code
+
+    if node_code is None:
+        node_code = (lambda n: n.get("code") if isinstance(n, dict) else None) if into == "instagram" else threads_node_code
+    if mk_nodes_fn is None:
+        mk_nodes_fn = mk_nodes if into == "instagram" else mk_thread_nodes
+
     seq = list(script)
-    seen = [n["code"] for n in (nodes_sink or [])]
+    seen = [c for c in (node_code(n) for n in (nodes_sink or [])) if c]
 
     async def fake_preview(uname, cursor=0, limit=2):
         item = seq.pop(0) if seq else CollectorError("parse", "脚本耗尽", 502)
@@ -106,18 +133,23 @@ def install_fakes(script, username, nodes_sink=None, rehydrate_sink=None, touche
             if p.shortcode not in seen:
                 seen.append(p.shortcode)
         if nodes_sink is not None:
-            nodes_sink[:] = mk_nodes(seen)
+            nodes_sink[:] = mk_nodes_fn(seen)
         return item
 
+    adapter = aj.PlatformAdapter(
+        name=into,
+        folder_prefix="threads_" if into == "threads" else "profile_",
+        preview=fake_preview,
+        rehydrate=(lambda u, nodes, ex: rehydrate_sink.append((u, len(nodes), ex))) if rehydrate_sink is not None else (lambda u, nodes, ex: None),
+        touch=(lambda u: touches.append(u)) if touches is not None else (lambda u: None),
+        reset=lambda u: None,
+        cache_nodes=(lambda u: list(nodes_sink)) if nodes_sink is not None else (lambda u: []),
+        node_code=node_code,
+    )
     aj.settings = FAKE_SETTINGS
     aj.scheduler = FAST_SCHED
-    aj.preview_profile = fake_preview
     aj._download_file = fake_download
-    aj.rehydrate_profile_cache = (
-        (lambda u, nodes, ex: rehydrate_sink.append((u, len(nodes), ex))) if rehydrate_sink is not None else (lambda u, nodes, ex: None)
-    )
-    aj.touch_profile_cache = (lambda u: touches.append(u)) if touches is not None else (lambda u: None)
-    aj.profile_cache_nodes = (lambda u: list(nodes_sink)) if nodes_sink is not None else (lambda u: [])
+    aj._ADAPTERS[into] = adapter
 
 
 class FakeCooldown:
@@ -317,6 +349,66 @@ async def main_async(tmp: Path) -> None:
     state10 = json.loads((folder10 / ".auto_state.json").read_text(encoding="utf-8"))
     ok("复用帖也写入清单 done（供后续增量停判）", state10["posts"]["H1"]["status"] == "done" and state10["posts"]["H2"]["status"] == "done")
 
+    print("\n=== Threads 平台：翻页→下载→清单/边车落 threads_{username} ===")
+    rootT = tmp / "secT"
+    nodes_t: list = []
+    touches_t: list = []
+    install_fakes(
+        [mk_page("tz", ["TA", "TB"], 0, True),
+         mk_page("tz", ["TC"], 2, False)],
+        "tz", nodes_sink=nodes_t, touches=touches_t, into="threads",
+    )
+    mgrT = AutoJobManager(rootT)
+    jobT = await mgrT.start("tz", platform="threads")
+    state = await drive(jobT)
+    st = jobT.status_dict()
+    ok("threads 任务跑至 done", state == "done" and st["counts"] == {"downloaded": 3, "skipped": 0, "failed": 0})
+    ok("状态含 platform=threads", st["platform"] == "threads")
+    folderT = rootT / "threads_tz"
+    filesT = sorted(p.name for p in folderT.glob("*.jpg"))
+    ok("文件落 threads_tz/", filesT == ["TA_1.jpg", "TB_1.jpg", "TC_1.jpg"])
+    stateT = json.loads((folderT / ".auto_state.json").read_text(encoding="utf-8"))
+    ok("清单记录 platform=threads 与 3 帖", stateT["platform"] == "threads" and len(stateT["posts"]) == 3)
+    sidecarT = (folderT / ".auto_nodes.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    from collector.threads_collector import threads_node_code
+    ok("threads 边车按嵌套 code 去重（3 行）",
+       len(sidecarT) == 3 and [threads_node_code(json.loads(l)) for l in sidecarT] == ["TA", "TB", "TC"])
+    ok("threads 每页 touch 保温（2 次）", len(touches_t) == 2)
+
+    print("\n=== 跨平台互斥：IG 活跃时 threads start 被拒 ===")
+    install_fakes([mk_page("u8b", ["M1"], 0, True)] * 10, "u8b")
+    mgrM = AutoJobManager(tmp / "secM")
+    jobM = await mgrM.start("u8b")  # Instagram 活跃
+    try:
+        await mgrM.start("tz2", platform="threads")
+        ok("跨平台重复启动被拒", False)
+    except AutoJobError as e:
+        ok("跨平台重复启动被拒（active_job，提示 Instagram）", e.kind == "active_job" and "Instagram" in str(e))
+    jobM.request_cancel()
+    await drive_terminal(jobM, timeout=4)
+
+    print("\n=== Threads 崩溃恢复：清单 + 边车回灌续跑 ===")
+    rootR = tmp / "secR"
+    folderR = rootR / "threads_tr"
+    folderR.mkdir(parents=True)
+    (folderR / ".auto_state.json").write_text(json.dumps({
+        "version": 1, "username": "tr", "cursor": 1, "exhausted": False, "mediacount": None,
+        "posts": {"TD1": {"status": "done", "files": [], "date_utc": ""}},
+        "failures": [], "counts": {"downloaded": 1, "skipped": 0, "failed": 0},
+    }), encoding="utf-8")
+    (folderR / ".auto_nodes.jsonl").write_text(
+        "\n".join(json.dumps(n) for n in mk_thread_nodes(["TD1"])), encoding="utf-8")
+    rhT: list = []
+    install_fakes([mk_page("tr", ["TD2"], 1, False)], "tr", nodes_sink=[], rehydrate_sink=rhT, into="threads")
+    mgrR = AutoJobManager(rootR)
+    jobR = await mgrR.start("tr", platform="threads")
+    state = await drive(jobR)
+    ok("threads 恢复续跑 → done", jobR.state == "done")
+    ok("启动时回灌 threads nodes（嵌套 code 被边车识别）", rhT and rhT[0] == ("tr", 1, False))
+    ok("恢复续跑计数（1+1，无重放跳过）", jobR.status_dict()["counts"]["downloaded"] == 2)
+    stateR = json.loads((folderR / ".auto_state.json").read_text(encoding="utf-8"))
+    ok("清单 platform 回填 threads", stateR["platform"] == "threads")
+
 
 def main_sync(tmp: Path) -> None:
     print("\n=== 清单损坏拒绝启动 ===")
@@ -343,9 +435,9 @@ def main_sync(tmp: Path) -> None:
     }), encoding="utf-8")
     good = json.dumps(mk_nodes(["E1"])[0])
     (folder2 / ".auto_nodes.jsonl").write_text(good + "\n" + '{"code": "E2", "tru', encoding="utf-8")  # 末行半写
-    from collector.auto_job import _Manifest
-    m = _Manifest(folder2)
-    m.load("userY")
+    from collector.auto_job import _Manifest, instagram_adapter
+    m = _Manifest(folder2, instagram_adapter.node_code)
+    m.load("userY", instagram_adapter)
     ok("边车末行半写被容忍（读到 1 个）", len(m.nodes) == 1)
     healed = (folder2 / ".auto_nodes.jsonl").read_text(encoding="utf-8")
     ok("半行丢弃后自愈重写（1 行且换行结尾，防 append 粘连）",
@@ -354,17 +446,38 @@ def main_sync(tmp: Path) -> None:
     # 回归：caption 含 U+2028 行分隔符（splitlines 误切的根源）→ split("\n") 完好读取
     node_u = {"code": "U1", "caption": {"text": "clouds and trees more"}}
     (folder2 / ".auto_nodes.jsonl").write_text(json.dumps(node_u, ensure_ascii=False) + "\n", encoding="utf-8")
-    mu = _Manifest(folder2)
-    mu.load("userY")
+    mu = _Manifest(folder2, instagram_adapter.node_code)
+    mu.load("userY", instagram_adapter)
     ok("U+2028 不再误判损坏", len(mu.nodes) == 1 and mu.nodes[0]["code"] == "U1")
 
     (folder2 / ".auto_nodes.jsonl").write_text("{bad json}\n" + good + "\n", encoding="utf-8")  # 中部损坏
-    m2 = _Manifest(folder2)
+    m2 = _Manifest(folder2, instagram_adapter.node_code)
     try:
-        m2.load("userY")
+        m2.load("userY", instagram_adapter)
         ok("边车中部损坏 → 拒绝", False)
     except AutoJobError as e:
         ok("边车中部损坏 → 拒绝", e.kind == "manifest_corrupt")
+
+    print("\n=== 旧清单无 platform 兼容 + threads 形状边车 ===")
+    from collector.auto_job import threads_adapter
+    folderL = tmp / "legacy" / "profile_userL"
+    folderL.mkdir(parents=True)
+    (folderL / ".auto_state.json").write_text(json.dumps({
+        "posts": {}, "cursor": 0, "exhausted": False,
+        "failures": [], "counts": {"downloaded": 0, "skipped": 0, "failed": 0},
+    }), encoding="utf-8")
+    mL = _Manifest(folderL, instagram_adapter.node_code)
+    mL.load("userL", instagram_adapter)
+    ok("旧 IG 清单（无 platform）→ instagram 兼容", mL.data["platform"] == "instagram")
+
+    folderN = tmp / "nodes_th" / "threads_userN"
+    folderN.mkdir(parents=True)
+    mN = _Manifest(folderN, threads_adapter.node_code)
+    mN.load("userN", threads_adapter)
+    mN.append_nodes(mk_thread_nodes(["N1", "N2", "N1"]))  # 含重复
+    ok("threads 边车 append 按嵌套 code 去重（2 个）", len(mN.nodes) == 2)
+    mN.rewrite_nodes(mk_thread_nodes(["N1", "N2", "N3"]))
+    ok("threads 边车 rewrite 保留 3 个", len(mN.nodes) == 3 and len(mN._saved_codes) == 3)
 
     print("\n=== 回灌切片对齐 + 保温（真实 collector 函数） ===")
     ic.rehydrate_profile_cache("userZ", mk_nodes(["N1", "N2", "N3", "N4", "N5"]), False)
