@@ -14,6 +14,9 @@ frontend-vite*.log
 # Local browser/profile state used by the collector
 .browser/
 
+# X 登录态探查产物：内含 x-csrf-token/auth 会话凭证，仅限本机
+openspec/probe_x_auth_summary.json
+
 # Downloaded Instagram media and metadata
 downloads/
 
