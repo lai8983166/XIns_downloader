@@ -44,6 +44,11 @@ from collector.threads_collector import (
     preview_threads_profile,
     threads_post_resources,
 )
+from collector.x_collector import (
+    extract_x_username,
+    preview_x_profile,
+    x_post_resources,
+)
 
 
 @asynccontextmanager
@@ -68,7 +73,15 @@ app.add_middleware(
 DOWNLOAD_ROOT = Path("downloads")
 FRONTEND_DIST = Path("frontend/dist")
 auto_manager = AutoJobManager(DOWNLOAD_ROOT)
-ALLOWED_MEDIA_HOST_SUFFIXES = ("cdninstagram.com", "fbcdn.net")
+ALLOWED_MEDIA_HOST_SUFFIXES = ("cdninstagram.com", "fbcdn.net", "twimg.com")
+DOWNLOAD_REFERER_INSTAGRAM = "https://www.instagram.com/"
+DOWNLOAD_REFERER_X = "https://x.com/"
+
+
+def _media_referer(media_url: str) -> str:
+    """按媒体域名选下载 Referer（twimg → x.com，其余 → instagram.com）。"""
+    host = (urlparse(media_url).hostname or "").lower()
+    return DOWNLOAD_REFERER_X if host.endswith("twimg.com") else DOWNLOAD_REFERER_INSTAGRAM
 PROFILE_DEFAULT_LIMIT = 6
 PROFILE_MAX_LIMIT = 24
 PROFILE_REQUEST_PAUSE_SECONDS = 2.0
@@ -553,7 +566,7 @@ def preview_profile_posts(profile_value: str, cursor: int, limit: int) -> Profil
 async def download_file(file_url: str, output_path: Path):
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.instagram.com/",
+        "Referer": _media_referer(file_url),
     }
 
     async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=headers) as client:
@@ -629,7 +642,7 @@ async def media_proxy(url: str = Query(...)):
     media_url = validate_remote_media_url(url)
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.instagram.com/",
+        "Referer": _media_referer(media_url),
     }
 
     try:
@@ -774,6 +787,66 @@ async def threads_profile_download(req: ProfileDownloadRequest):
         raise HTTPException(status_code=500, detail=f"Threads profile download failed: {type(e).__name__}: {e}")
 
 
+@app.post("/x/profile/preview", response_model=ProfilePreviewResponse)
+async def x_profile_preview(req: ProfilePreviewRequest):
+    if not collector_settings.use_collector:
+        raise HTTPException(status_code=503, detail="X 采集仅支持浏览器方案（collector）")
+    _acquire_manual_slot()
+    try:
+        return _profile_preview_to_response(await preview_x_profile(req.profile, req.cursor, req.limit))
+    except HTTPException:
+        raise
+    except CollectorError as e:
+        raise _map_collector_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"X profile preview failed: {type(e).__name__}: {e}")
+    finally:
+        scheduler.report_finish()
+
+
+@app.post("/x/profile/download", response_model=ProfileDownloadResponse)
+async def x_profile_download(req: ProfileDownloadRequest):
+    try:
+        username = extract_x_username(req.username)
+        if not req.items:
+            raise HTTPException(status_code=400, detail="No posts selected")
+        if not collector_settings.use_collector:
+            raise HTTPException(status_code=503, detail="X 下载仅支持浏览器方案（collector）")
+
+        _acquire_manual_slot()
+        folder = DOWNLOAD_ROOT / f"x_{username}"
+        folder.mkdir(parents=True, exist_ok=True)
+        saved_files = []
+
+        for selected_post in req.items:
+            tweet_id = selected_post.shortcode.strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", tweet_id):
+                raise HTTPException(status_code=400, detail=f"Invalid tweet id: {tweet_id}")
+            resources = await x_post_resources(username, tweet_id, selected_post.selected_indices)
+            for r in resources:
+                output_path = folder / r.filename
+                await download_file(r.url, output_path)
+                saved_files.append(str(output_path).replace("\\", "/"))
+        scheduler.report_finish()
+
+        if not saved_files:
+            raise HTTPException(status_code=400, detail="No selected media found")
+
+        return ProfileDownloadResponse(
+            status="done",
+            username=username,
+            folder=str(folder).replace("\\", "/"),
+            files=saved_files,
+        )
+
+    except HTTPException:
+        raise
+    except CollectorError as e:
+        raise _map_collector_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"X profile download failed: {type(e).__name__}: {e}")
+
+
 @app.post("/download", response_model=DownloadResponse)
 async def download(req: DownloadRequest):
     try:
@@ -869,6 +942,26 @@ async def threads_profile_auto_start(req: AutoStartRequest):
     return AutoStartResponse(job_id=job.job_id, username=username, state=job.state)
 
 
+@app.post("/x/profile/auto", response_model=AutoStartResponse, status_code=202)
+async def x_profile_auto_start(req: AutoStartRequest):
+    """启动 X 自动任务：与 IG/Threads 同一状态机/调度/熔断，清单落 x_{username}。"""
+    try:
+        username = extract_x_username(req.profile)
+    except CollectorError as e:
+        raise _map_collector_error(e)
+    try:
+        job = await auto_manager.start(username, req.max_posts, platform="x")
+    except AutoJobError as e:
+        if e.kind == "active_job":
+            active = auto_manager.active_job()
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(e), "job_id": active.job_id if active else None},
+            )
+        raise HTTPException(status_code=400, detail=str(e))  # manifest_corrupt 等
+    return AutoStartResponse(job_id=job.job_id, username=username, state=job.state)
+
+
 @app.get("/profile/auto/jobs/{job_id}")
 async def profile_auto_status(job_id: str):
     """任务状态/进度（specs/auto-download Progress observability）。"""
@@ -943,7 +1036,7 @@ async def review_folders():
         for entry in sorted(DOWNLOAD_ROOT.iterdir(), key=lambda p: p.name):
             if not entry.is_dir() or entry.name.startswith((".", "_")):
                 continue
-            if not (entry.name.startswith("profile_") or entry.name.startswith("threads_")):
+            if not (entry.name.startswith("profile_") or entry.name.startswith("threads_") or entry.name.startswith("x_")):
                 continue
             count = len(_review_files_in(entry))
             if count > 0:

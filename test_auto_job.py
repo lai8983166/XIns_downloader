@@ -86,7 +86,7 @@ def mk_page(username, codes, cursor, has_more):
     )
 
 
-async def fake_download(url, output):
+async def fake_download(url, output, referer=None):
     output.write_bytes(b"fake-media")
 
 
@@ -108,19 +108,38 @@ def mk_thread_nodes(codes):
     ]
 
 
+def mk_x_nodes(codes):
+    """X 原始推文节点形状：id 在 rest_id / legacy.id_str。"""
+    return [
+        {
+            "rest_id": c,
+            "legacy": {
+                "id_str": c,
+                "extended_entities": {"media": [{"type": "photo", "media_url_https": f"https://pbs.twimg.com/media/{c}.jpg"}]},
+            },
+        }
+        for c in codes
+    ]
+
+
 def install_fakes(script, username, nodes_sink=None, rehydrate_sink=None, touches=None,
                   into="instagram", node_code=None, mk_nodes_fn=None):
     """注入 fake adapter/下载/调度；script 逐次弹出 ProfilePreview 或异常。
 
     nodes_sink 模拟采集层缓存的原始 nodes（跨 install 累积，同真实缓存语义）。
-    into="threads" 时按 threads 节点形状构造（node_code 提取嵌套 code），落 threads_ 前缀。
+    into 按平台选节点形状与 code 提取器（threads/x 为嵌套结构），落对应文件夹前缀。
     """
-    from collector.threads_collector import threads_node_code
-
     if node_code is None:
-        node_code = (lambda n: n.get("code") if isinstance(n, dict) else None) if into == "instagram" else threads_node_code
+        if into == "threads":
+            from collector.threads_collector import threads_node_code
+            node_code = threads_node_code
+        elif into == "x":
+            from collector.x_collector import x_node_code
+            node_code = x_node_code
+        else:
+            node_code = (lambda n: n.get("code") if isinstance(n, dict) else None)
     if mk_nodes_fn is None:
-        mk_nodes_fn = mk_nodes if into == "instagram" else mk_thread_nodes
+        mk_nodes_fn = {"threads": mk_thread_nodes, "x": mk_x_nodes}.get(into, mk_nodes)
 
     seq = list(script)
     seen = [c for c in (node_code(n) for n in (nodes_sink or [])) if c]
@@ -138,13 +157,14 @@ def install_fakes(script, username, nodes_sink=None, rehydrate_sink=None, touche
 
     adapter = aj.PlatformAdapter(
         name=into,
-        folder_prefix="threads_" if into == "threads" else "profile_",
+        folder_prefix={"threads": "threads_", "x": "x_"}.get(into, "profile_"),
         preview=fake_preview,
         rehydrate=(lambda u, nodes, ex: rehydrate_sink.append((u, len(nodes), ex))) if rehydrate_sink is not None else (lambda u, nodes, ex: None),
         touch=(lambda u: touches.append(u)) if touches is not None else (lambda u: None),
         reset=lambda u: None,
         cache_nodes=(lambda u: list(nodes_sink)) if nodes_sink is not None else (lambda u: []),
         node_code=node_code,
+        download_referer="https://x.com/" if into == "x" else "https://www.instagram.com/",
     )
     aj.settings = FAKE_SETTINGS
     aj.scheduler = FAST_SCHED
@@ -408,6 +428,32 @@ async def main_async(tmp: Path) -> None:
     ok("恢复续跑计数（1+1，无重放跳过）", jobR.status_dict()["counts"]["downloaded"] == 2)
     stateR = json.loads((folderR / ".auto_state.json").read_text(encoding="utf-8"))
     ok("清单 platform 回填 threads", stateR["platform"] == "threads")
+
+    print("\n=== X 平台：翻页→下载→清单/边车落 x_{username} ===")
+    rootX = tmp / "secX"
+    nodes_x: list = []
+    touches_x: list = []
+    install_fakes(
+        [mk_page("xu", ["XA", "XB"], 0, True),
+         mk_page("xu", ["XC"], 2, False)],
+        "xu", nodes_sink=nodes_x, touches=touches_x, into="x",
+    )
+    mgrX = AutoJobManager(rootX)
+    jobX = await mgrX.start("xu", platform="x")
+    state = await drive(jobX)
+    stX = jobX.status_dict()
+    ok("x 任务跑至 done", state == "done" and stX["counts"] == {"downloaded": 3, "skipped": 0, "failed": 0})
+    ok("状态含 platform=x", stX["platform"] == "x")
+    folderX = rootX / "x_xu"
+    filesX = sorted(p.name for p in folderX.glob("*.jpg"))
+    ok("文件落 x_xu/", filesX == ["XA_1.jpg", "XB_1.jpg", "XC_1.jpg"])
+    stateX = json.loads((folderX / ".auto_state.json").read_text(encoding="utf-8"))
+    ok("清单记录 platform=x 与 3 帖", stateX["platform"] == "x" and len(stateX["posts"]) == 3)
+    sidecarX = (folderX / ".auto_nodes.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    from collector.x_collector import x_node_code
+    ok("x 边车按推文 id 去重（3 行）",
+       len(sidecarX) == 3 and [x_node_code(json.loads(l)) for l in sidecarX] == ["XA", "XB", "XC"])
+    ok("x 每页 touch 保温（2 次）", len(touches_x) == 2)
 
 
 def main_sync(tmp: Path) -> None:

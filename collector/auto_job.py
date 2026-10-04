@@ -59,6 +59,14 @@ from collector.threads_collector import (
     threads_node_code,
     touch_threads_cache,
 )
+from collector.x_collector import (
+    preview_x_profile,
+    rehydrate_x_cache,
+    reset_x_cache,
+    x_cache_nodes,
+    x_node_code,
+    touch_x_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +95,17 @@ class AutoJobError(Exception):
 
 @dataclass(frozen=True)
 class PlatformAdapter:
-    """自动任务的平台差异面：翻页采集函数组 + 缓存挂钩 + 文件夹前缀 + 边车 code 提取器。"""
+    """自动任务的平台差异面：翻页采集函数组 + 缓存挂钩 + 文件夹前缀 + 边车 code 提取器 + 下载 Referer。"""
 
-    name: str                                  # "instagram" | "threads"
-    folder_prefix: str                         # "profile_" | "threads_"（与手动下载目录一致）
+    name: str                                  # "instagram" | "threads" | "x"
+    folder_prefix: str                         # "profile_" | "threads_" | "x_"（与手动下载目录一致）
     preview: Callable[..., Any]                # 翻页采集（受调度/冷却/信号检测保护）
     rehydrate: Callable[..., None]             # 恢复时回灌采集层缓存
     touch: Callable[..., None]                 # 活跃期保温（防 TTL 淘汰）
     reset: Callable[..., None]                 # 增量刷新时丢弃缓存（保证时间线顺序）
     cache_nodes: Callable[..., List[dict]]     # 读缓存原始 nodes（边车增量落盘）
-    node_code: Callable[[dict], Optional[str]]  # 原始节点 → 帖子 code（边车去重；threads 在嵌套层）
+    node_code: Callable[[dict], Optional[str]]  # 原始节点 → 帖子标识（边车去重；threads/x 在嵌套层）
+    download_referer: str                      # CDN 媒体下载 Referer（x → x.com）
 
 
 instagram_adapter = PlatformAdapter(
@@ -108,6 +117,7 @@ instagram_adapter = PlatformAdapter(
     reset=reset_profile_cache,
     cache_nodes=profile_cache_nodes,
     node_code=lambda n: n.get("code") if isinstance(n, dict) else None,
+    download_referer="https://www.instagram.com/",
 )
 
 threads_adapter = PlatformAdapter(
@@ -119,9 +129,22 @@ threads_adapter = PlatformAdapter(
     reset=reset_threads_cache,
     cache_nodes=threads_cache_nodes,
     node_code=threads_node_code,
+    download_referer="https://www.instagram.com/",
 )
 
-_ADAPTERS: Dict[str, PlatformAdapter] = {a.name: a for a in (instagram_adapter, threads_adapter)}
+x_adapter = PlatformAdapter(
+    name="x",
+    folder_prefix="x_",
+    preview=preview_x_profile,
+    rehydrate=rehydrate_x_cache,
+    touch=touch_x_cache,
+    reset=reset_x_cache,
+    cache_nodes=x_cache_nodes,
+    node_code=x_node_code,
+    download_referer="https://x.com/",
+)
+
+_ADAPTERS: Dict[str, PlatformAdapter] = {a.name: a for a in (instagram_adapter, threads_adapter, x_adapter)}
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -134,11 +157,11 @@ def _next_midnight() -> float:
     return datetime.combine(tomorrow, datetime.min.time()).timestamp()
 
 
-async def _download_file(url: str, output: Path) -> None:
-    """CDN 媒体下载（同 main.py download_file 的 UA/Referer 语义；不占动作名额）。"""
+async def _download_file(url: str, output: Path, referer: str = "https://www.instagram.com/") -> None:
+    """CDN 媒体下载（Referer 按平台 adapter 传入；不占动作名额）。"""
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.instagram.com/",
+        "Referer": referer,
     }
     async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=headers) as client:
         async with client.stream("GET", url) as response:
@@ -554,7 +577,7 @@ class AutoJob:
             last_exc: Optional[Exception] = None
             for attempt in range(3):  # 1 + 2 重试
                 try:
-                    await _download_file(res.url, part)
+                    await _download_file(res.url, part, referer=self.adapter.download_referer)
                     os.replace(part, final)
                     files.append(str(final).replace("\\", "/"))
                     return

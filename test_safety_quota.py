@@ -51,6 +51,9 @@ def main() -> int:
     ok("限流短语 → rate_limited", detect_signal(body="Please wait a few minutes before you try again") == SIGNAL_RATE_LIMITED)
     ok("/challenge → challenge", detect_signal(url="https://www.instagram.com/challenge/xyz") == SIGNAL_CHALLENGE)
     ok("/accounts/login → login_wall", detect_signal(url="https://www.instagram.com/accounts/login/") == SIGNAL_LOGIN_WALL)
+    # X 平台登录墙（x-download-mode：既有 /login hint 已覆盖，仅固化）
+    ok("x.com/login → login_wall", detect_signal(url="https://x.com/login") == SIGNAL_LOGIN_WALL)
+    ok("x.com/i/flow/login → login_wall", detect_signal(url="https://x.com/i/flow/login") == SIGNAL_LOGIN_WALL)
     ok("空响应 → unexpected", detect_signal(body="   ") == SIGNAL_UNEXPECTED)
     ok("正常内容 → None", detect_signal(url="https://www.instagram.com/p/ABC/", body="some media json") is None)
 

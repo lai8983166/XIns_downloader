@@ -79,11 +79,19 @@ function App() {
   const autoTerminal = AUTO_TERMINAL_STATES.includes(autoStatus?.state);
 
   const isThreads = platform === "threads";
-  const profilePath = isThreads ? "/threads/profile/preview" : "/profile/preview";
-  const profileDownloadPath = isThreads ? "/threads/profile/download" : "/profile/download";
-  const autoStartPath = isThreads ? "/threads/profile/auto" : "/profile/auto";
-  // Threads 无单帖模式（profile/auto/review 可用）；IG 全模式。effectiveMode 统一判断
-  const effectiveMode = isThreads && mode === "post" ? "profile" : mode;
+  const isX = platform === "x";
+  const platformName = isX ? "X" : isThreads ? "Threads" : "Instagram";
+  const PLATFORM_PATHS = {
+    ig: { profile: "/profile/preview", download: "/profile/download", auto: "/profile/auto" },
+    threads: { profile: "/threads/profile/preview", download: "/threads/profile/download", auto: "/threads/profile/auto" },
+    x: { profile: "/x/profile/preview", download: "/x/profile/download", auto: "/x/profile/auto" },
+  };
+  const platformPaths = PLATFORM_PATHS[platform] ?? PLATFORM_PATHS.ig;
+  const profilePath = platformPaths.profile;
+  const profileDownloadPath = platformPaths.download;
+  const autoStartPath = platformPaths.auto;
+  // Threads/X 无单帖模式（profile/auto/review 可用）；IG 全模式。effectiveMode 统一判断
+  const effectiveMode = platform !== "ig" && mode === "post" ? "profile" : mode;
 
   const postResources = postPreview?.resources ?? [];
   const profilePosts = profilePreview?.posts ?? [];
@@ -209,7 +217,7 @@ function App() {
       nextMode === "profile"
         ? "输入用户名或主页链接后分页预览。"
         : nextMode === "auto"
-          ? `输入${isThreads ? " Threads" : " Instagram"}用户主页链接，启动后自动翻页下载全部内容。`
+          ? `输入${platformName}用户主页链接，启动后自动翻页下载全部内容。`
           : nextMode === "review"
             ? "选择一个文件夹开始审查：1 保留 / 2 候选 / 3 删除。"
             : "输入帖子链接后预览图片。"
@@ -223,8 +231,8 @@ function App() {
 
   function handlePlatformChange(nextPlatform) {
     setPlatform(nextPlatform);
-    // Threads 无单帖模式：仅从「单帖」回落 profile，其余模式（profile/auto/review）保留
-    if (nextPlatform === "threads" && mode === "post") {
+    // Threads/X 无单帖模式：仅从「单帖」回落 profile，其余模式（profile/auto/review）保留
+    if (nextPlatform !== "ig" && mode === "post") {
       setMode("profile");
     }
     setPostPreview(null);
@@ -233,9 +241,9 @@ function App() {
     setProfileSelected(new Set());
     setLightbox(null);
     setStatus(
-      nextPlatform === "threads"
-        ? "输入 Threads 用户名后分页预览，或切「自动」批量下载。"
-        : "输入帖子链接后预览图片。"
+      nextPlatform === "ig"
+        ? "输入帖子链接后预览图片。"
+        : `输入${nextPlatform === "x" ? " X" : " Threads"}用户名后分页预览，或切「自动」批量下载。`
     );
   }
 
@@ -315,7 +323,7 @@ function App() {
   async function startAutoJob() {
     const profile = input.trim();
     if (!profile) {
-      setStatus(isThreads ? "请输入 Threads 用户名或主页链接" : "请输入 Instagram 用户名或主页链接");
+      setStatus(`请输入${platformName}用户名或主页链接`);
       return;
     }
     setAutoStarting(true);
@@ -340,7 +348,7 @@ function App() {
       }
       setAutoStatus(null);
       setAutoJobId(data.job_id);
-      setStatus(`自动任务已启动：${isThreads ? "Threads" : "Instagram"} @${data.username}，将按拟人日程自动翻页下载`);
+      setStatus(`自动任务已启动：${platformName} @${data.username}，将按拟人日程自动翻页下载`);
     } catch (error) {
       setStatus(`启动失败：${error.message}`);
     } finally {
@@ -387,7 +395,7 @@ function App() {
   async function loadProfilePage({ reset }) {
     const profile = input.trim();
     if (!profile) {
-      setStatus(isThreads ? "请输入 Threads 用户名或主页链接" : "请输入 Instagram 用户名或主页链接");
+      setStatus(`请输入${platformName}用户名或主页链接`);
       return;
     }
 
@@ -556,9 +564,16 @@ function App() {
             >
               Threads
             </button>
+            <button
+              className={platform === "x" ? "modeButton active" : "modeButton"}
+              type="button"
+              onClick={() => handlePlatformChange("x")}
+            >
+              X
+            </button>
           </div>
           <div className="modeSwitch" role="tablist" aria-label="下载模式">
-            {!isThreads && (
+            {platform === "ig" && (
               <button
                 className={mode === "post" ? "modeButton active" : "modeButton"}
                 type="button"
@@ -611,14 +626,18 @@ function App() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               placeholder={
-                isThreads
-                  ? "输入 Threads 用户名或主页链接"
-                  : effectiveMode === "post"
-                    ? "粘贴 Instagram 帖子、Reel 或 TV 链接"
-                    : "输入用户名或主页链接"
+                isX
+                  ? "输入 X 用户名或主页链接"
+                  : isThreads
+                    ? "输入 Threads 用户名或主页链接"
+                    : effectiveMode === "post"
+                      ? "粘贴 Instagram 帖子、Reel 或 TV 链接"
+                      : "输入用户名或主页链接"
               }
               aria-label={
-                isThreads ? "Threads 用户名" : effectiveMode === "post" ? "Instagram 链接" : "Instagram 用户名"
+                isX ? "X 用户名"
+                  : isThreads ? "Threads 用户名"
+                  : effectiveMode === "post" ? "Instagram 链接" : "Instagram 用户名"
               }
             />
           )}
@@ -886,7 +905,9 @@ function AutoJobPanel({ jobId, status, onCancel }) {
         <span className={`stateChip ${terminal ? "stateTerminal" : state.startsWith("paused") ? "statePaused" : "stateActive"}`}>
           {stateLabel}
         </span>
-        {status?.platform && <span>{status.platform === "threads" ? "Threads" : "Instagram"}</span>}
+        {status?.platform && (
+          <span>{status.platform === "x" ? "X" : status.platform === "threads" ? "Threads" : "Instagram"}</span>
+        )}
         <strong>@{status?.username ?? "…"}</strong>
         {status?.max_posts ? <span>上限 {status.max_posts} 新帖</span> : null}
         <span>job {jobId}</span>
